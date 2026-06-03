@@ -1,0 +1,9 @@
+models/
+data/
+metrics/
+venv/
+__pycache__/
+*.png
+*.pkl
+*.keras
+*.csv
