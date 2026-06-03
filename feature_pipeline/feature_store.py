@@ -9,17 +9,18 @@ from pymongo import MongoClient
 from pymongo.errors import PyMongoError
 from dotenv import load_dotenv
 
-# Search for environment keys up the directory stack
+# Search for environment keys up the directory stack for local debugging
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
-MONGO_URI = os.getenv("MONGO_CONNECTION_STRING")
-DB_NAME = "KarachiAirQualityFeatureStore"
-COLLECTION_NAME = "hourly_features"
+# Unified environment key to match your GitHub Secrets configuration
+MONGO_URI = os.getenv("MONGODB_URI")
+DB_NAME = "karachi_aqi"
+COLLECTION_NAME = "processed_features"
 
 def get_feature_store_client():
     """Establishes an authenticated connection pool with the remote Atlas Cluster."""
     if not MONGO_URI:
-        raise ValueError("CRITICAL: MONGO_CONNECTION_STRING is missing from environment variables.")
+        raise ValueError("CRITICAL: MONGODB_URI is missing from environment variables.")
     try:
         client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
         # Force validation ping to catch network blocks early
@@ -50,10 +51,14 @@ def ingest_hourly_features(features_payload: list[dict]) -> int:
             print("WARNING: Skipped document missing index anchor field: 'timestamp'")
             continue
         try:
+            # Handle potential NaN to string mapping conversions or conversions MongoDB dislikes
+            # Replace numpy nan/inf with None so they translate cleanly to Null in Mongo
+            clean_doc = {k: (None if isinstance(v, float) and pd.isna(v) else v) for k, v in doc.items()}
+            
             # Upsert operations update existing matching keys or insert if new
             result = collection.update_one(
-                {"timestamp": doc["timestamp"]},
-                {"$set": doc},
+                {"timestamp": clean_doc["timestamp"]},
+                {"$set": clean_doc},
                 upsert=True
             )
             if result.upserted_id or result.modified_count > 0:
@@ -87,6 +92,7 @@ def extract_historical_feature_matrix() -> pd.DataFrame:
         return pd.DataFrame()
         
     df = pd.DataFrame(documents)
+    
     # Enforce strict chronological order across the dataframe index
     if "timestamp" in df.columns:
         df["datetime"] = pd.to_datetime(df["timestamp"])
@@ -122,9 +128,8 @@ if __name__ == "__main__":
     ]
     
     print("\n[Step 1] Initializing secure cluster validation testing...")
-    if not os.getenv("MONGO_CONNECTION_STRING"):
-        print("-> Action Required: Create a '.env' file in the root directory and add:")
-        print("   MONGO_CONNECTION_STRING=\"mongodb+srv://<user>:<pwd>@cluster...\"")
+    if not os.getenv("MONGODB_URI"):
+        print("-> Action Required: Ensure 'MONGODB_URI' environment variable is exported or present in a local .env file.")
     else:
         try:
             write_count = ingest_hourly_features(mock_payload)

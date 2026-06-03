@@ -1,47 +1,41 @@
 """
 build_dataset.py
 -----------------
-Fetches raw weather + air-quality data for Karachi and safely merges them.
-
-Key fixes vs original:
-  1. After the inner join, fills short isolated gaps (≤ 3 hours) in all pollutant
-     columns via linear interpolation before dropping rows. Open-Meteo occasionally
-     returns 1–3 h NaN gaps inside otherwise clean blocks; dropping them wastes data.
-  2. Prints a full missingness audit across EVERY column, not just pollutants.
-  3. Saves both the raw merged file AND a gap-filled version so you can inspect both.
-
-Run:
-    python build_dataset.py
+Fetches raw weather + air-quality data directly from MongoDB, merges them,
+handles short-gap interpolation, and stores the aligned records back to MongoDB.
 """
 
-from pathlib import Path
+import os
+import pymongo
 import pandas as pd
 
-from fetch_weather import fetch_weather
-from fetch_air_quality import fetch_air_quality
-
-
-# Maximum contiguous NaN run (hours) to fill via interpolation before hard-dropping
 MAX_GAP_FILL_HOURS = 3
 
 
 def main():
-    print("Fetching weather data...")
-    weather_df = fetch_weather()
+    mongo_uri = os.environ.get("MONGODB_URI")
+    if not mongo_uri:
+        raise ValueError("MONGODB_URI environment variable is missing!")
 
-    print("\nFetching air quality data...")
-    aq_df = fetch_air_quality()
+    client = pymongo.MongoClient(mongo_uri)
+    db = client["karachi_aqi"]
 
-    # ── 1. Normalize datetime to tz-naive ────────────────────────────────────
-    for frame in (weather_df, aq_df):
-        col = frame["datetime"]
-        if pd.api.types.is_datetime64_any_dtype(col):
-            if col.dt.tz is not None:
-                frame["datetime"] = col.dt.tz_localize(None)
-        else:
-            frame["datetime"] = pd.to_datetime(col).dt.tz_localize(None)
+    print("Extracting raw data from MongoDB cloud collections...")
+    
+    # 1. Download records from MongoDB collections
+    raw_weather_cursor = db["raw_weather"].find()
+    raw_aqi_cursor = db["raw_air_quality"].find()
 
-    # ── 2. Inner join on matching timestamps ─────────────────────────────────
+    weather_df = pd.DataFrame(list(raw_weather_cursor)).drop(columns=["_id"], errors="ignore")
+    aq_df = pd.DataFrame(list(raw_aqi_cursor)).drop(columns=["_id"], errors="ignore")
+
+    if weather_df.empty or aq_df.empty:
+        raise RuntimeError("One or both MongoDB raw data collections are empty! Run the fetch scripts first.")
+
+    # 2. Normalize datetime representations
+    weather_df["datetime"] = pd.to_datetime(weather_df["datetime"])
+    aq_df["datetime"] = pd.to_datetime(aq_df["datetime"])
+
     print("\nExecuting synchronized datetime alignment join...")
     dataset = (
         pd.merge(weather_df, aq_df, on="datetime", how="inner")
@@ -50,21 +44,9 @@ def main():
     )
     print(f"Merged shape (before gap-fill): {dataset.shape}")
 
-    # ── 3. Full missingness audit ─────────────────────────────────────────────
-    print("\n" + "=" * 65)
-    print("      FULL COLUMN MISSINGNESS AUDIT (post-merge)")
-    print("=" * 65)
-    for col in dataset.columns:
-        n = dataset[col].isna().sum()
-        p = n / len(dataset) * 100
-        flag = "  ← HIGH" if p > 5 else ""
-        print(f"  {col:<35}: {n:>6} NaN  ({p:5.2f}%){flag}")
-
-    # ── 4. Short-gap linear interpolation (≤ MAX_GAP_FILL_HOURS) ─────────────
-    # Only applied to numeric pollutant/weather columns, never to datetime.
+    # 3. Short-gap linear interpolation (≤ MAX_GAP_FILL_HOURS)
     pollutant_cols = ["pm25", "pm10", "co", "no2", "so2", "o3", "dust", "uv_index"]
-    weather_numeric = [c for c in dataset.select_dtypes(include="number").columns
-                       if c not in pollutant_cols]
+    weather_numeric = [c for c in dataset.select_dtypes(include="number").columns if c not in pollutant_cols]
 
     for col in pollutant_cols + weather_numeric:
         if col not in dataset.columns:
@@ -72,35 +54,34 @@ def main():
         n_before = dataset[col].isna().sum()
         if n_before == 0:
             continue
-        # Interpolate only within gaps ≤ MAX_GAP_FILL_HOURS
-        dataset[col] = (
-            dataset[col]
-            .interpolate(method="linear", limit=MAX_GAP_FILL_HOURS, limit_direction="forward")
-        )
+        dataset[col] = dataset[col].interpolate(method="linear", limit=MAX_GAP_FILL_HOURS, limit_direction="forward")
         n_after = dataset[col].isna().sum()
         if n_before != n_after:
-            print(f"  [gap-fill] {col}: {n_before} → {n_after} NaN  (filled {n_before - n_after})")
+            print(f"  [gap-fill] {col}: {n_before} → {n_after} NaN (filled {n_before - n_after})")
 
-    # ── 5. Hard drop rows with no valid PM2.5 target ─────────────────────────
+    # 4. Hard drop rows with no valid PM2.5 target
     initial_shape = len(dataset)
     dataset = dataset.dropna(subset=["pm25"]).reset_index(drop=True)
     dropped = initial_shape - len(dataset)
-    print(f"\nDropped {dropped} rows with missing PM2.5 "
-          f"({dropped / initial_shape * 100:.3f}% of merged dataset).")
+    print(f"\nDropped {dropped} rows with missing PM2.5 ({dropped / initial_shape * 100:.2f}% of dataset).")
 
-    # ── 6. Save outputs ───────────────────────────────────────────────────────
-    data_dir = Path(__file__).resolve().parent / "data" / "raw"
-    data_dir.mkdir(parents=True, exist_ok=True)
+    # 5. Save the output dataset BACK to MongoDB
+    dataset_upload = dataset.copy()
+    dataset_upload["datetime"] = dataset_upload["datetime"].dt.strftime("%Y-%m-%d %H:%M:%S")
+    records = dataset_upload.to_dict(orient="records")
 
-    out_path = data_dir / "karachi_aqi_dataset.csv"
-    dataset.to_csv(out_path, index=False)
+    if records:
+        output_collection = db["karachi_aqi_dataset"]
+        print(f"Saving {len(records)} clean merged rows to collection 'karachi_aqi_dataset'...")
+        for record in records:
+            output_collection.update_one(
+                {"datetime": record["datetime"]},
+                {"$set": record},
+                upsert=True
+            )
 
-    print(f"\nCleaned dataset saved → {out_path}")
-    print(f"Final shape          : {dataset.shape}")
-    print(f"Date range           : {dataset['datetime'].min()}  →  {dataset['datetime'].max()}")
-    print("\nFirst 5 rows preview:")
-    preview_cols = ["datetime", "temperature", "humidity", "pm25", "co", "dust"]
-    print(dataset[[c for c in preview_cols if c in dataset.columns]].head())
+    client.close()
+    print("\nSuccessfully built dataset and updated your Cloud Feature Store!")
 
 
 if __name__ == "__main__":

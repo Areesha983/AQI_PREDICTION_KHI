@@ -3,13 +3,14 @@ Enterprise MLOps Feature Summary Construction Pipeline for Karachi.
 Pipes newly engineered analytical indicators straight into the MongoDB Feature Store.
 """
 
-from pathlib import Path
+import os
 import sys
+from pathlib import Path
 import numpy as np
 import pandas as pd
+import pymongo
 
 # ── SYSTEM PATH SETUP ──────────────────────────────────────────────────────────
-# Dynamically locate KARACHI_AQI_PREDICTOR/ directory relative to this file
 PIPELINE_DIR = Path(__file__).resolve().parent
 BASE_DIR = PIPELINE_DIR.parent
 if str(BASE_DIR) not in sys.path:
@@ -22,7 +23,6 @@ except ImportError:
     try:
         from dashboard.database import ingest_hourly_features
     except ImportError:
-        # Fallback to local package directory imports if structural bindings differ
         from feature_store import ingest_hourly_features
 
 
@@ -292,7 +292,7 @@ def build_features(df_raw: pd.DataFrame) -> pd.DataFrame:
     if {"pm25", "pm10"}.issubset(df.columns):
         poll_cols["pm25_pm10_ratio"] = (
             df["pm25"].shift(1) / (df["pm10"].shift(1) + 1e-3)
-        ).clip(upper=10)   # physically capped at 10 (was 50 — too wide)
+        ).clip(upper=10)   
         poll_cols["pm25_fraction"] = (
             df["pm25"].shift(1)
             / (df["pm25"].shift(1) + df["pm10"].shift(1) + 1e-3)
@@ -301,7 +301,6 @@ def build_features(df_raw: pd.DataFrame) -> pd.DataFrame:
     if {"no2", "o3"}.issubset(df.columns):
         poll_cols["no2_o3_ratio"] = df["no2"].shift(1) / (df["o3"].shift(1) + 1e-3)
 
-    # Dust channel features (new)
     if "dust" in df.columns:
         _dust = df["dust"].shift(1)
         poll_cols["dust_lag_1"]       = _dust
@@ -328,7 +327,6 @@ def build_features(df_raw: pd.DataFrame) -> pd.DataFrame:
     if "wind_speed" in df.columns:
         ws_lag1 = df["wind_speed"].shift(1)
         met_cols["wind_speed_roll_std_24"] = ws_lag1.rolling(24, min_periods=1).std().fillna(0)
-        # Season-invariant wind persistence ratio (reduces KS drift vs raw roll mean)
         ws_roll24 = ws_lag1.rolling(24, min_periods=1).mean()
         ws_roll168 = ws_lag1.rolling(168, min_periods=1).mean()
         met_cols["wind_persistence_ratio"] = ws_roll24 / (ws_roll168 + 0.1)
@@ -343,7 +341,6 @@ def build_features(df_raw: pd.DataFrame) -> pd.DataFrame:
     if {"wind_speed", "pm25"}.issubset(df.columns):
         met_cols["wind_dispersal"] = df["wind_speed"].shift(1) / (df["pm25"].shift(1) + 5)
 
-    # Boundary Layer proxy: dew-point depression (T - Td) → mixing height
     if {"temperature", "dew_point"}.issubset(df.columns):
         met_cols["dew_point_depression"]      = df["temperature"].shift(1) - df["dew_point"].shift(1)
         met_cols["dew_pt_depression_roll24"]  = met_cols["dew_point_depression"].rolling(24, min_periods=1).mean()
@@ -391,62 +388,37 @@ def build_features(df_raw: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-# ── 3. CLI Trigger & MongoDB Ingestion ────────────────────────────────────────
+# ── 3. MongoDB Feature Pipeline Extraction and Streaming Execution ────────────
 
 if __name__ == "__main__":
-    # Fixed Path Resolution relative to the Project Workspace Directory root
-    raw_path = BASE_DIR / "data" / "raw" / "karachi_aqi_dataset.csv"
+    mongo_uri = os.getenv("MONGODB_URI")
+    if not mongo_uri:
+        raise ValueError("CRITICAL: MONGODB_URI missing from environment contexts.")
 
-    if not raw_path.exists():
-        raw_path.parent.mkdir(parents=True, exist_ok=True)
-        print("[Notice] Generating structural mock dataset for validation...")
-        dates = pd.date_range(start="2023-01-01", periods=15000, freq="h", name="datetime")
-        mock = pd.DataFrame({
-            "pm25":             np.random.uniform(15, 300, len(dates)),
-            "pm10":             np.random.uniform(30, 450, len(dates)),
-            "temperature":      np.random.uniform(12, 44,  len(dates)),
-            "humidity":         np.random.uniform(20, 95,  len(dates)),
-            "wind_speed":       np.random.uniform(2,  35,  len(dates)),
-            "wind_direction":   np.random.uniform(0,  360, len(dates)),
-            "wind_gusts":       np.random.uniform(5,  55,  len(dates)),
-            "cloud_cover":      np.random.uniform(0,  100, len(dates)),
-            "dew_point":        np.random.uniform(5,  30,  len(dates)),
-            "surface_pressure": np.random.uniform(990, 1020, len(dates)),
-            "dust":             np.random.uniform(0,  200, len(dates)),
-            "uv_index":         np.random.uniform(0,  12,  len(dates)),
-            "co":               np.random.uniform(200, 600, len(dates)),
-            "no2":              np.random.uniform(5,  80,  len(dates)),
-            "so2":              np.random.uniform(1,  50,  len(dates)),
-            "o3":               np.random.uniform(10, 120, len(dates)),
-            "precipitation":    np.random.exponential(0.5,  len(dates)),
-            "pressure":         np.random.uniform(990, 1020, len(dates)),
-        }, index=dates).reset_index()
-        mock.to_csv(raw_path, index=False)
+    print("\n" + "="*70)
+    print(" 📥 EXTRACTING INPUT ALIGNED ARTIFACT FROM MONGODB")
+    print("="*70)
+    
+    # Connect directly to download the base dataset collection generated by build_dataset.py
+    client = pymongo.MongoClient(mongo_uri)
+    db = client["karachi_aqi"]
+    input_collection = db["karachi_aqi_dataset"]
+    
+    cursor = input_collection.find()
+    raw_df = pd.DataFrame(list(cursor))
+    client.close()
+    
+    if raw_df.empty:
+        raise RuntimeError("CRITICAL: 'karachi_aqi_dataset' document store collection is completely empty.")
+        
+    if "_id" in raw_df.columns:
+        raw_df = raw_df.drop(columns=["_id"])
 
-    print(f"\nReading historical data points out from: {raw_path.name}")
-    raw_df = pd.read_csv(raw_path)
+    # Ensure native datetime conversions
+    raw_df["datetime"] = pd.to_datetime(raw_df["datetime"])
+
+    # Compute high-dimensional feature spaces
     processed_df = build_features(raw_df)
-
-    # Separate targets from structural training indicators
-    EXCLUDE = {
-        "datetime", "aqi",
-        "target_aqi_12h",  "target_aqi_24h",  "target_aqi_48h",  "target_aqi_72h",
-        "target_aqi_12h_log", "target_aqi_24h_log", "target_aqi_48h_log", "target_aqi_72h_log",
-        "target_cat_12h",  "target_cat_24h",  "target_cat_48h",  "target_cat_72h",
-        "hour", "day", "month", "weekday", "day_of_year", "hour_of_week",
-        "week_of_year",
-    }
-    feature_columns = [c for c in processed_df.columns if c not in EXCLUDE]
-
-    # Save artifact files locally for testing configurations
-    out_dir = BASE_DIR / "data" / "processed"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "feature_columns.txt").write_text("\n".join(feature_columns))
-    processed_df.to_csv(out_dir / "featured_dataset.csv", index=False)
-
-    print("\nLocal processing complete. File artifacts generated on disk.")
-    print(f"Final Matrix Shape   : {processed_df.shape}")
-    print(f"Total Model Features : {len(feature_columns)}")
 
     # ── MLOPS FEATURE STORE LOADING BLOCK ────────────────────────────────────
     print("\n" + "="*70)
@@ -461,7 +433,7 @@ if __name__ == "__main__":
     features_payload = mongo_df.to_dict(orient="records")
     print(f"Prepared {len(features_payload):,} documents for Atlas integration.")
     
-    # Execute batch transactional mutations
+    # Execute batch transactional mutations into the centralized feature store collection
     print("Connecting to remote cluster interface layer...")
     records_upserted = ingest_hourly_features(features_payload)
     print(f"✅ Success! Feature Store synchronized: {records_upserted:,} records modified.")

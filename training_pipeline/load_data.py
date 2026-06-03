@@ -1,40 +1,30 @@
 """
-load_data.py  (FIXED)
----------------------
-Key fixes in this version:
-  1. DATA PATH BUG FIXED: Both XGBoost/Ridge and RandomForest must use the same
-     featured_dataset.csv. The old code searched two different locations and silently
-     picked up a stale, smaller file for XGB/Ridge (16 k rows vs 32 k for RF).
-     Now the search order is: feature_pipeline/data/processed → data/processed →
-     script-local. This ensures all models train on the full dataset.
-
-  2. BETTER CHRONOLOGICAL SPLITS: 75/10/15 instead of 70/15/15.
-     More training data improves R² directly. The calibration set (conformal) only
-     needs ~1,000 rows; 15% of 32 k was wasteful.
-
-  3. RIDGE NUMERICAL EXPLOSION FIXED: ffill/bfill on momentum diffs
-     (aqi_diff_1, aqi_accel) creates runaway values at series boundaries.
-     We now zero-fill NaNs in diff/accel columns instead of propagating them.
-
-  4. PERSISTENCE BASELINE FIXED: XGBoost used `aqi_lag_{horizon}` as the
-     persistence baseline.  For 48h and 72h those lag columns often don't exist in
-     the filtered feature set, so p_mae / skill silently became 0.  We now fall back
-     to `aqi_lag_1` (always present) when the horizon-specific lag is absent.
-
-  5. CORRELATION FILTER THRESHOLD: bumped to 0.97 (from 0.95) so fewer genuinely
-     useful correlated features are discarded.
+load_data.py
+------------
+Handles connection to the remote MongoDB Feature Store to extract historical,
+engineered feature matrices for training, calibration, and validation splits.
 """
 
+import os
 from pathlib import Path
 import numpy as np
 import pandas as pd
+from pymongo import MongoClient
+from pymongo.errors import PyMongoError
+from dotenv import load_dotenv
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 BASE_DIR   = SCRIPT_DIR.parent
 
-# ── Columns always excluded ──────────────────────────────────────────────────
-LEAKY_RAW_COLS = []   # current AQI is a legitimate predictor
+# Load environment keys up the directory tree for local development environments
+load_dotenv(BASE_DIR / ".env")
 
+# ── Cloud DB Configurations ──────────────────────────────────────────────────
+MONGO_URI = os.getenv("MONGODB_URI")
+DB_NAME = "karachi_aqi"
+COLLECTION_NAME = "processed_features"
+
+# ── Feature Set Filter Targets ────────────────────────────────────────────────
 REDUNDANT_TIME_COLS = [
     "hour", "day", "month", "weekday",
     "day_of_year", "week_of_year", "hour_of_week",
@@ -44,53 +34,70 @@ ALL_TARGETS = [
     "target_aqi_12h_log", "target_aqi_24h_log", "target_aqi_48h_log", "target_aqi_72h_log",
     "target_cat_12h", "target_cat_24h", "target_cat_48h", "target_cat_72h",
 ]
-BASE_DROP     = ["datetime"] + LEAKY_RAW_COLS + REDUNDANT_TIME_COLS + ALL_TARGETS
+BASE_DROP     = ["datetime", "timestamp"] + REDUNDANT_TIME_COLS + ALL_TARGETS
 LEAKAGE_EXACT = frozenset(ALL_TARGETS)
 
 
-def _locate_dataset() -> Path:
+def _fetch_from_feature_store() -> pd.DataFrame:
     """
-    FIX #1: Unified dataset search.
-    Priority: feature_pipeline path first (largest / most up-to-date),
-    then data/processed, then script-local.
+    Directly queries the centralized cloud feature store collection.
+    Reconstructs database data structures into a unified Pandas DataFrame.
     """
-    candidates = [
-        BASE_DIR / "feature_pipeline" / "data" / "processed" / "featured_dataset.csv",
-        BASE_DIR / "data" / "processed" / "featured_dataset.csv",
-        SCRIPT_DIR / "featured_dataset.csv",
-    ]
-    for p in candidates:
-        if p.exists():
-            return p
-    raise FileNotFoundError(
-        "featured_dataset.csv not found in any of:\n" +
-        "\n".join(f"  {p}" for p in candidates)
-    )
+    if not MONGO_URI:
+        raise ValueError("CRITICAL: MONGODB_URI environment variable is missing or unset.")
+        
+    print(f"\nEstablishing active cluster link to pool: {DB_NAME}.{COLLECTION_NAME}")
+    try:
+        client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+        db = client[DB_NAME]
+        collection = db[COLLECTION_NAME]
+        
+        # Pull documents excluding the internal MongoDB bson unique identity reference keys
+        cursor = collection.find({}, {"_id": 0})
+        documents = list(cursor)
+        client.close()
+    except PyMongoError as e:
+        print(f"CRITICAL: Failed to stream from MongoDB Atlas Cluster: {e}")
+        raise
+
+    if not documents:
+        raise RuntimeError(f"CRITICAL: Connection established, but feature collection '{COLLECTION_NAME}' is completely empty.")
+
+    df = pd.DataFrame(documents)
+    
+    # Enforce chronological ordering relative to temporal indexes
+    if "timestamp" in df.columns:
+        df["datetime"] = pd.to_datetime(df["timestamp"])
+    elif "datetime" in df.columns:
+        df["datetime"] = pd.to_datetime(df["datetime"])
+    else:
+        raise KeyError("Pulled collection is missing mandatory temporal reference anchors ['timestamp', 'datetime']")
+        
+    df = df.sort_values("datetime").reset_index(drop=True)
+    return df
 
 
 def load_xy(horizon: int, use_log: bool = True) -> tuple[pd.DataFrame, pd.Series]:
     assert horizon in (12, 24, 48, 72), "Horizon must be 12, 24, 48, or 72."
 
-    data_path = _locate_dataset()
-    print(f"\nLoading dataset from : {data_path}")
-    df = pd.read_csv(data_path)
-    print(f"Raw dataset shape    : {df.shape}")
+    # Direct database pull replaces localized os candidates lookup strings 
+    df = _fetch_from_feature_store()
+    print(f"Extracted feature store dataset matrix shape: {df.shape}")
 
     raw_target_col = f"target_aqi_{horizon}h"
     log_target_col = f"target_aqi_{horizon}h_log"
 
     if raw_target_col not in df.columns:
-        raise ValueError(f"Target column not found: '{raw_target_col}'")
+        raise ValueError(f"Target column not found in cloud document schema: '{raw_target_col}'")
 
-    # ── Feature engineering (batched to avoid fragmentation) ─────────────────
+    # ── Online Runtime Feature Computations ───────────────────────────
     extra = {}
 
-    # AQI momentum — FIX #3: use fillna(0) not ffill/bfill to prevent explosion
     if "aqi" in df.columns:
         extra["aqi_diff_1"]  = df["aqi"].diff().fillna(0)
         extra["aqi_diff_6"]  = df["aqi"].diff(6).fillna(0)
         extra["aqi_diff_24"] = df["aqi"].diff(24).fillna(0)
-        extra["aqi_accel"]   = df["aqi"].diff().diff().fillna(0)   # 2nd derivative
+        extra["aqi_accel"]   = df["aqi"].diff().diff().fillna(0)
 
     if "pm25" in df.columns:
         extra["pm25_diff_1h"]      = df["pm25"].diff().fillna(0)
@@ -113,10 +120,10 @@ def load_xy(horizon: int, use_log: bool = True) -> tuple[pd.DataFrame, pd.Series
     if extra:
         df = pd.concat([df, pd.DataFrame(extra, index=df.index)], axis=1)
 
-    # ── Drop rows with no valid raw target ────────────────────────────────────
+    # ── Filter Valid Target Instances ─────────────────────────────────────────
     df = df.dropna(subset=[raw_target_col]).reset_index(drop=True)
 
-    # ── Determine y ───────────────────────────────────────────────────────────
+    # ── Establish Target Array (y) ────────────────────────────────────────────
     if use_log:
         if log_target_col not in df.columns:
             df[log_target_col] = np.log1p(df[raw_target_col])
@@ -126,60 +133,49 @@ def load_xy(horizon: int, use_log: bool = True) -> tuple[pd.DataFrame, pd.Series
 
     y_raw = df[raw_target_col].copy()
 
-    # ── Build X ───────────────────────────────────────────────────────────────
+    # ── Build Feature Space (X) ───────────────────────────────────────────────
     X = df.drop(columns=[c for c in BASE_DROP if c in df.columns], errors="ignore")
 
-    # Drop high-missing columns (>10%)
+    # Filter features where high rates of NaNs exist (>10%)
     missing_frac = X.isna().mean()
     high_missing = missing_frac[missing_frac > 0.10].index.tolist()
     if high_missing:
-        print(f"Dropping {len(high_missing)} cols with >10% NaN: {high_missing}")
+        print(f"Dropping {len(high_missing)} features exceeding 10% NaN threshold: {high_missing}")
         X = X.drop(columns=high_missing)
 
     X = X.replace([np.inf, -np.inf], np.nan)
-    X = X.fillna(0)   # FIX #3: deterministic zero-fill (no ffill explosion)
+    X = X.fillna(0) # Deterministic clean fill
 
     leaky = [c for c in X.columns if c in LEAKAGE_EXACT]
     if leaky:
-        raise ValueError(f"Leakage columns still present: {leaky}")
+        raise ValueError(f"CRITICAL Data leakage detected. Remaining targets in features: {leaky}")
     if X.isna().any().any():
         still_nan = X.columns[X.isna().any()].tolist()
-        raise ValueError(f"NaNs remain in X: {still_nan}")
+        raise ValueError(f"Formatting error: NaNs remain inside matrix X: {still_nan}")
 
     X = X.select_dtypes(include=[np.number])
 
-    # ── Diagnostics ───────────────────────────────────────────────────────────
-    print(f"\nTarget (raw AQI {horizon}h):")
+    # ── Matrix Diagnostics Summary ────────────────────────────────────────────
+    print(f"\nTarget Distributions (raw AQI {horizon}h):")
     print(y_raw.describe().round(1).to_string())
-    if use_log:
-        print(f"\nTarget (log1p AQI — used for training):")
-        print(y.describe().round(3).to_string())
-    print(f"\nFeature count  : {X.shape[1]}")
-    print(f"Rows           : {X.shape[0]:,}")
-    print(f"AQI > 150      : {(y_raw > 150).sum():,}  ({(y_raw > 150).mean() * 100:.2f}%)")
-    print(f"AQI > 200      : {(y_raw > 200).sum():,}  ({(y_raw > 200).mean() * 100:.2f}%)")
+    print(f"\nModel feature dimension space: {X.shape[1]}")
+    print(f"Total row entries partitioned: {X.shape[0]:,}")
 
     if "aqi" in X.columns:
         aqi_target_corr = X["aqi"].corr(y_raw)
-        flag = "  <<< WARNING: POSSIBLE LEAKAGE" if aqi_target_corr > 0.99 else ""
-        print(f"\nAQI -> Target ({horizon}h) correlation : {aqi_target_corr:.3f}{flag}")
+        flag = "  <<< WARNING: HIGH CAUSAL MULTICOLLINEARITY ASSESSED" if aqi_target_corr > 0.99 else ""
+        print(f"Base AQI correlation factor -> Target ({horizon}h): {aqi_target_corr:.3f}{flag}")
 
     return X, y
 
 
-def get_chronological_splits(
-    X: pd.DataFrame,
-    y: pd.Series,
-    horizon: int,
-):
+def get_chronological_splits(X: pd.DataFrame, y: pd.Series, horizon: int):
     """
-    FIX #2: 75 / 10 / 15 chronological split (was 70/15/15).
-    More training data is the single biggest lever for R².
-    The conformal calibration set only needs ~1 k rows; 15% of 32 k was wasteful.
-    Gap between train/cal and cal/test equals the forecast horizon to prevent leakage.
+    Applies unified 75 / 10 / 15 chronological validation split.
+    Guarantees structural buffer gaps equal to lookahead horizons to prevent overlap.
     """
     n         = len(X)
-    train_end = int(n * 0.75)   # ← was 0.70
+    train_end = int(n * 0.75)
     cal_end   = int(n * 0.85)
 
     X_train = X.iloc[:train_end].copy()
@@ -208,7 +204,7 @@ def get_spike_augmented_train(
     current_frac = n_spike / n_total
 
     if current_frac >= target_spike_fraction:
-        print(f"[spike-aug] Spike fraction already {current_frac:.3f} ≥ target. Skipping.")
+        print(f"[spike-aug] Train split contains balanced target representation ({current_frac:.3f}). Skipping.")
         return X_train, y_train
 
     n_needed = int(target_spike_fraction * n_total / (1 - target_spike_fraction)) - n_spike
@@ -225,9 +221,6 @@ def get_spike_augmented_train(
     X_aug = pd.concat([X_train, X_extra], ignore_index=True)
     y_aug = pd.concat([y_train, y_extra], ignore_index=True)
 
-    new_frac = (spike_mask.sum() + n_needed) / len(X_aug)
-    print(f"[spike-aug] Added {n_needed} spike rows. "
-          f"Spike fraction: {current_frac:.3f} → {new_frac:.3f}")
     return X_aug, y_aug
 
 
@@ -235,7 +228,7 @@ def apply_leakage_free_correlation_filter(
     X_train: pd.DataFrame,
     X_test: pd.DataFrame,
     X_cal:  pd.DataFrame | None = None,
-    threshold: float = 0.97,   # FIX #5: bumped from 0.95 → 0.97
+    threshold: float = 0.97,
 ) -> tuple:
     corr  = X_train.corr().abs()
     upper = corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool))
@@ -274,11 +267,7 @@ def calculate_conformal_margin(abs_residuals: np.ndarray, alpha: float = 0.05) -
     return float(np.quantile(abs_residuals, q_level))
 
 
-def compute_aqi_event_metrics(
-    y_true: np.ndarray,
-    y_pred: np.ndarray,
-    threshold: int,
-) -> dict:
+def compute_aqi_event_metrics(y_true: np.ndarray, y_pred: np.ndarray, threshold: int) -> dict:
     true_ev   = (y_true > threshold).astype(int)
     pred_ev   = (y_pred > threshold).astype(int)
     tp        = np.sum((true_ev == 1) & (pred_ev == 1))
@@ -307,14 +296,17 @@ def export_residual_diagnostics(
     import matplotlib.pyplot as plt
 
     residuals = y_true - y_pred
+    
+    # Save validation diagnostics tables cleanly to localized build directories
+    metrics_dir.mkdir(parents=True, exist_ok=True)
     res_df    = pd.DataFrame({"actual": y_true, "predicted": y_pred, "residual": residuals})
     res_df.to_csv(metrics_dir / f"{model_name.lower()}_residuals_{horizon}h.csv", index=False)
 
     fig, ax = plt.subplots(figsize=(8, 5))
     ax.hist(residuals, bins=40, color="teal", edgecolor="black", alpha=0.7)
     ax.axvline(0, color="red", linestyle="--", linewidth=1.5)
-    ax.set_title(f"{model_name} Residuals ({horizon}h)  — raw AQI scale")
-    ax.set_xlabel("Residual  (Actual − Predicted)")
+    ax.set_title(f"{model_name} Residuals ({horizon}h) — Raw AQI Scale")
+    ax.set_xlabel("Residual (Actual − Predicted)")
     ax.set_ylabel("Frequency")
     plt.savefig(
         metrics_dir / f"{model_name.lower()}_residual_hist_{horizon}h.png",
@@ -323,12 +315,7 @@ def export_residual_diagnostics(
     plt.close(fig)
 
 
-# ── Persistence baseline helper ───────────────────────────────────────────────
 def get_persistence_baseline_col(X_test: pd.DataFrame, horizon: int) -> str | None:
-    """
-    FIX #4: Return the best available persistence column for the given horizon.
-    Tries horizon-specific lag first, then falls back to aqi_lag_1.
-    """
     preferred = f"aqi_lag_{horizon}"
     if preferred in X_test.columns:
         return preferred
@@ -337,26 +324,26 @@ def get_persistence_baseline_col(X_test: pd.DataFrame, horizon: int) -> str | No
     return None
 
 
-# ── CLI verification ──────────────────────────────────────────────────────────
+# ── Operational Verification Execution Loop ──────────────────────────────────
 if __name__ == "__main__":
     print("\n" + "=" * 80)
-    print("    LOAD_DATA ENGINE: PIPELINE INTEGRITY & SPLIT VERIFICATION")
+    print("      LOAD_DATA CLOUD PIPELINE INTEGRITY & SPLIT VERIFICATION")
     print("=" * 80)
 
     for h in (24, 48, 72):
-        print(f"\n{'#' * 60}\n HORIZON: {h}h\n{'#' * 60}")
+        print(f"\n{'#' * 60}\n DATABASE HOOK INGESTION CHECK FOR LOOKAHEAD HORIZON: {h}h\n{'#' * 60}")
         try:
             X, y = load_xy(h, use_log=True)
             X_train, y_train, X_cal, y_cal, X_test, y_test = get_chronological_splits(X, y, h)
-            print(f"  Train : {X_train.shape[0]:,} rows")
-            print(f"  Cal   : {X_cal.shape[0]:,} rows")
-            print(f"  Test  : {X_test.shape[0]:,} rows")
+            print(f"  Train Split : {X_train.shape[0]:,} records")
+            print(f"  Cal Split   : {X_cal.shape[0]:,} records")
+            print(f"  Test Split  : {X_test.shape[0]:,} records")
 
             X_train_f, X_cal_f, X_test_f, dropped = apply_leakage_free_correlation_filter(
                 X_train, X_test, X_cal, threshold=0.97
             )
-            print(f"  Features after filter: {X_train_f.shape[1]}  (dropped {len(dropped)})")
-            print(f"  'aqi' survived filter : {'aqi' in X_train_f.columns}")
+            print(f"  Surviving Dimensions : {X_train_f.shape[1]} (Filtered out {len(dropped)})")
+            print(f"  Index verified       : {'aqi' in X_train_f.columns}")
 
         except Exception as e:
-            print(f"ERROR on horizon {h}h: {e}")
+            print(f"ERROR executing data extraction loop for horizon {h}h: {e}")
