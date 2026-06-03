@@ -13,13 +13,15 @@ Key fixes vs original:
   5. Conformal prediction margins computed on the raw-AQI scale after
      inverse-transforming calibration predictions.
 
-  ── FIX (2025-06) ─────────────────────────────────────────────────────────
+  ── FIXES ─────────────────────────────────────────────────────────
   6. Spike fraction reduced 0.20 → 0.15. At 0.20 the model was overfitting
      to spikes, which hurt coverage on AQI>150 events (was 40–59%).
-  7. Correlation filter re-enabled (was accidentally disabled in a prior edit).
+  7. Correlation filter re-enabled and aligned to threshold=0.97.
      Protected set in load_data.py ensures key features survive.
   8. SHAP disabled for now — re-enable once R² targets are met by setting
      COMPUTE_SHAP = True.
+  9. Replaced old hardcoded lag lookups with get_persistence_baseline_col() 
+     so 48h/72h skill scores don't silently break when long-range lags are pruned.
 """
 
 from pathlib import Path
@@ -52,6 +54,7 @@ from load_data import (
     calculate_conformal_margin,
     compute_aqi_event_metrics,
     export_residual_diagnostics,
+    get_persistence_baseline_col,   # FIX #1: Added import
 )
 
 try:
@@ -129,11 +132,9 @@ def train_rf(horizon: int) -> dict:
         get_chronological_splits(X, y_raw, horizon)
 
     # ── 2. Correlation filter ─────────────────────────────────────────────────
-    # FIX: filter was accidentally disabled in the previous version.
-    # Protected set in load_data.py guarantees key features (aqi, lags, pm25,
-    # pm10, momentum features) are never dropped regardless of correlation.
+    # FIX #2: Aligned threshold to 0.97 matching fixed load_data / xgboost configurations
     X_train, X_cal, X_test, dropped_cols = apply_leakage_free_correlation_filter(
-        X_train, X_test, X_cal, threshold=0.95,
+        X_train, X_test, X_cal, threshold=0.97,
     )
     print(f"Features after filter: {X_train.shape[1]}  (dropped {len(dropped_cols)})")
 
@@ -143,8 +144,6 @@ def train_rf(horizon: int) -> dict:
         METRICS_DIR / f"rf_features_{horizon}h.csv", index=False)
 
     # ── 3. Spike augmentation ─────────────────────────────────────────────────
-    # FIX: reduced from 0.20 → 0.15. At 0.20 the model overfit to spikes and
-    # coverage on AQI>150 events was only 40–59%. 0.15 is a safer balance.
     X_train_aug, y_train_aug = get_spike_augmented_train(
         X_train, y_train_log,
         y_train_raw=y_train_raw,
@@ -243,13 +242,15 @@ def train_rf(horizon: int) -> dict:
     stratified_bands = error_analysis(y_arr, preds_raw)
     quantile_errors  = quantile_error_analysis(y_arr, preds_raw)
 
-    lag_col = f"aqi_lag_{horizon}"
+    # FIX #3: Use robust baseline helper to avoid failures if target-horizon lag columns get dropped
+    lag_col = get_persistence_baseline_col(X_test, horizon)
     p_mae = p_r2 = skill = r2_imp = 0.0
-    if lag_col in X_test.columns:
+    if lag_col:
         p_mae  = mean_absolute_error(y_arr, X_test[lag_col].values)
         p_r2   = r2_score(y_arr, X_test[lag_col].values)
         skill  = float(1.0 - test_mae / p_mae) if p_mae > 0 else 0.0
         r2_imp = test_r2 - p_r2
+        print(f"  Persistence baseline: {lag_col}  (MAE={p_mae:.1f}, skill={skill:.3f})")
 
     # ── 10. Save predictions ──────────────────────────────────────────────────
     pd.DataFrame({
@@ -311,14 +312,15 @@ def train_rf(horizon: int) -> dict:
         "model":                        "RandomForest",
         "horizon":                      f"{horizon}h",
         "training_target":              "log1p(AQI)",
-        "cv_mean_val_rmse_log":         float(cv_rmse),
-        "cv_std_val_rmse_log":          float(cv_std),
+        "cv_mean_val_rmse_log":          float(cv_rmse),
+        "cv_std_val_rmse_log":           float(cv_std),
         "test_rmse":                    float(test_rmse),
         "test_mae":                     float(test_mae),
         "test_median_ae":               float(test_median_ae),
         "test_mape":                    float(test_mape),
         "test_r2":                      float(test_r2),
         "test_explained_variance":      float(test_evs),
+        "baseline_lag_col":             lag_col or "none",
         "baseline_horizon_mae":         float(p_mae),
         "baseline_horizon_r2":          float(p_r2),
         "forecast_skill_score":         float(skill),

@@ -8,6 +8,10 @@ Key fixes vs original:
   2. Conformal margins computed on the raw-AQI scale.
   3. nan% Coverage >200 fixed — was NaN because no predictions crossed the
      raw threshold after the old straight-line prediction on a skewed target.
+  4. Linear-model imputation added after chronological split — load_xy() now
+     returns NaNs intact for tree models. Ridge/StandardScaler cannot handle
+     NaN natively, so impute_for_linear() is called here, fitted on X_train
+     only and applied to X_cal/X_test to prevent any leakage.
 """
 
 from pathlib import Path
@@ -36,6 +40,7 @@ from load_data import (
     calculate_conformal_margin,
     compute_aqi_event_metrics,
     export_residual_diagnostics,
+    impute_for_linear,
 )
 
 try:
@@ -74,6 +79,14 @@ def train_ridge(horizon: int) -> dict:
     pd.DataFrame({"feature": X_train.columns}).to_csv(
         METRICS_DIR / f"ridge_features_{horizon}h.csv", index=False)
     print(f"Features after filter: {X_train.shape[1]}  (dropped {len(dropped_cols)})")
+
+    # ── 2b. Linear-model imputation (train-mean, no leakage) ─────────────────
+    # load_xy() now returns NaNs intact so tree models can route them natively.
+    # Ridge and StandardScaler cannot handle NaN, so we impute here AFTER the
+    # chronological split — means are fitted on X_train only, then applied to
+    # X_cal and X_test. Doing this before the split would leak test statistics.
+    X_train, X_cal, X_test = impute_for_linear(X_train, X_cal, X_test)
+    print("Linear imputation applied (train-mean, fitted on X_train only).")
 
     # ── 3. TimeSeries CV folds ────────────────────────────────────────────────
     n_splits  = 4

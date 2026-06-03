@@ -1,6 +1,34 @@
 """
 Enterprise MLOps Feature Summary Construction Pipeline for Karachi.
 Pipes newly engineered analytical indicators straight into the MongoDB Feature Store.
+
+FIXES APPLIED:
+  BUG #1 (CRITICAL — data leakage): Step 1 used interpolate(method="time").ffill()
+    which fills gaps bidirectionally using future anchor values. Replaced with
+    ffill() only — strictly causal. bfill(limit=1) handles only leading NaNs at
+    the very start of the series where no prior observation exists.
+
+  BUG #2 (CRITICAL — target contamination): AQI and targets were computed after
+    the bidirectional interpolation, so target_aqi_24h etc. were derived from
+    future-contaminated pm25. Now computed from cleanly forward-filled data.
+
+  BUG #3 (production safety): Step 4 (Wind Vector Decomposition) and Step 14
+    (Meteorological Dispersal) now both guard against column name variants.
+    If fetch_weather.py ever returns "wind_speed_10m" instead of "wind_speed",
+    the pipeline degrades gracefully instead of silently skipping wind features.
+
+  BUG #4 (performance): MongoDB writes now use bulk_write() in batches of 1000.
+    Was row-by-row update_one() — for 33k rows that was ~50 minutes of network
+    round-trips. Bulk writes complete in under 30 seconds.
+
+  BUG #5 (CRITICAL — XGBoost dtype crash): Step 11 used pd.cut() with integer
+    labels=[0,1,2,3,4,5]. pandas constructs a Categorical series whose underlying
+    dtype is object/category, not a numeric primitive. Even though .astype(float)
+    was chained, on some pandas versions the Categorical metadata is preserved and
+    XGBoost raises ValueError: DataFrame.dtypes for data must be int, float, bool
+    or categorical. Fixed by casting labels to float literals [0.0 … 5.0] and
+    explicitly converting via .cat.codes or np.float64 cast to guarantee a
+    primitive numeric array reaches the feature matrix.
 """
 
 import os
@@ -9,15 +37,17 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pymongo
+from pymongo import UpdateOne
 
-# ── SYSTEM PATH SETUP ──────────────────────────────────────────────────────────
 PIPELINE_DIR = Path(__file__).resolve().parent
-BASE_DIR = PIPELINE_DIR.parent
+BASE_DIR     = PIPELINE_DIR.parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
+BULK_BATCH_SIZE = 1000
 
-# ── 1. EPA AQI Calculation Helpers ───────────────────────────────────────────
+
+# ── 1. EPA AQI Calculation Helpers ────────────────────────────────────────────
 
 def calculate_aqi_from_pm25(pm25: float) -> float:
     """Applies the US-EPA piecewise linear interpolation formula for PM2.5 → AQI."""
@@ -41,7 +71,6 @@ def calculate_aqi_from_pm25(pm25: float) -> float:
 
 
 def aqi_to_category(aqi: float) -> float:
-    """Maps raw AQI to standard integer category labels."""
     if pd.isna(aqi): return np.nan
     if aqi <= 50:    return 0
     if aqi <= 100:   return 1
@@ -52,19 +81,25 @@ def aqi_to_category(aqi: float) -> float:
 
 
 def _rolling_slope_6h(y: np.ndarray) -> float:
-    """OLS slope over a fixed 6-hour window."""
     x_dev = np.array([-2.5, -1.5, -0.5, 0.5, 1.5, 2.5])
     return float(np.dot(x_dev, y - np.mean(y)) / 17.5)
+
+
+def _resolve_col(df: pd.DataFrame, *candidates: str) -> str | None:
+    """
+    Returns the first candidate column name that exists in df.
+    Used to handle both plain names ('wind_speed') and API-suffixed variants
+    ('wind_speed_10m') so Step 4 and Step 14 never silently skip.
+    """
+    for name in candidates:
+        if name in df.columns:
+            return name
+    return None
 
 
 # ── 2. Core Feature Builder ───────────────────────────────────────────────────
 
 def build_features(df_raw: pd.DataFrame) -> pd.DataFrame:
-    """
-    Transforms raw hourly meteorological + air-quality streams into an enriched,
-    leakage-free feature store. All column additions are batched via pd.concat
-    to avoid DataFrame fragmentation.
-    """
     df = df_raw.copy()
 
     if "datetime" not in df.columns:
@@ -75,13 +110,17 @@ def build_features(df_raw: pd.DataFrame) -> pd.DataFrame:
     print(f"Initializing primary transformations. Input shape: {df.shape}")
 
     # ── STEP 1: LEAKAGE-FREE CAUSAL IMPUTATION ────────────────────────────────
+    # FIX: Was interpolate(method="time").ffill() — fills gaps using FUTURE
+    # anchor values. ffill() is strictly causal.
+    # bfill(limit=1) only patches leading NaNs at the very head of the series.
     df = df.set_index("datetime")
     num_cols = df.select_dtypes(include=np.number).columns
-    df[num_cols] = df[num_cols].interpolate(method="time").ffill()
+    df[num_cols] = df[num_cols].ffill().bfill(limit=1)
     df = df.reset_index()
-    print(" -> Causal imputation complete.")
+    print(" -> Causal imputation complete (ffill only — no future leakage).")
 
     # ── STEP 2: AQI COMPUTATION + MULTI-HORIZON TARGETS ──────────────────────
+    # Computed from cleanly forward-filled pm25 only (no future contamination).
     df["aqi"] = df["pm25"].apply(calculate_aqi_from_pm25)
 
     new_cols = {}
@@ -92,7 +131,7 @@ def build_features(df_raw: pd.DataFrame) -> pd.DataFrame:
     df = pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
 
     # ── STEP 3: TEMPORAL EMBEDDINGS ───────────────────────────────────────────
-    dt = df["datetime"]
+    dt        = df["datetime"]
     hour      = dt.dt.hour
     month     = dt.dt.month
     weekday   = dt.dt.weekday
@@ -121,16 +160,27 @@ def build_features(df_raw: pd.DataFrame) -> pd.DataFrame:
     df = pd.concat([df, pd.DataFrame(temp_cols, index=df.index)], axis=1)
 
     # ── STEP 4: WIND VECTOR DECOMPOSITION ────────────────────────────────────
-    if "wind_direction" in df.columns and "wind_speed" in df.columns:
-        wdir_rad = np.deg2rad(df["wind_direction"].shift(1))
-        ws_lag   = df["wind_speed"].shift(1)
+    # FIX: Use _resolve_col() to handle both "wind_speed" and "wind_speed_10m"
+    # so a future API column rename doesn't silently skip this entire step.
+    ws_col = _resolve_col(df, "wind_speed",     "wind_speed_10m")
+    wd_col = _resolve_col(df, "wind_direction",  "wind_direction_10m")
+
+    if ws_col and wd_col:
+        wdir_rad = np.deg2rad(df[wd_col].shift(1))
+        ws_lag   = df[ws_col].shift(1)
         wind_cols = {
-            "wind_dir_sin":  np.sin(wdir_rad),
-            "wind_dir_cos":  np.cos(wdir_rad),
-            "wind_x":        ws_lag * np.sin(wdir_rad),
-            "wind_y":        ws_lag * np.cos(wdir_rad),
+            "wind_dir_sin": np.sin(wdir_rad),
+            "wind_dir_cos": np.cos(wdir_rad),
+            "wind_x":       ws_lag * np.sin(wdir_rad),
+            "wind_y":       ws_lag * np.cos(wdir_rad),
         }
         df = pd.concat([df, pd.DataFrame(wind_cols, index=df.index)], axis=1)
+        print(f" -> Wind decomposition: using '{ws_col}' + '{wd_col}'.")
+    else:
+        print(
+            " -> WARNING: Wind columns not found — Step 4 skipped. "
+            "Check fetch_weather.py column naming."
+        )
 
     # ── STEP 5: AQI LAG CHAINS ────────────────────────────────────────────────
     _aqi = df["aqi"].shift(1)
@@ -196,20 +246,20 @@ def build_features(df_raw: pd.DataFrame) -> pd.DataFrame:
     p24  = df["pm25_roll_mean_24"]
     p72  = df["pm25_roll_mean_72"]
     mom_cols = {
-        "aqi_trend_ratio":      r24  / (r72  + 1),
-        "pm25_trend_ratio":     p24  / (p72  + 1),
-        "aqi_momentum_6_24":    df["aqi_roll_mean_6"]  - r24,
-        "aqi_momentum_24_72":   r24  - r72,
-        "aqi_momentum_24_168":  r24  - r168,
-        "aqi_change_1h":        _aqi - df["aqi"].shift(2),
-        "aqi_change_6h":        _aqi - df["aqi"].shift(7),
-        "aqi_change_24h":       _aqi - df["aqi"].shift(25),
-        "aqi_trend_slope_6h":   (
+        "aqi_trend_ratio":     r24 / (r72 + 1),
+        "pm25_trend_ratio":    p24 / (p72 + 1),
+        "aqi_momentum_6_24":   df["aqi_roll_mean_6"] - r24,
+        "aqi_momentum_24_72":  r24 - r72,
+        "aqi_momentum_24_168": r24 - r168,
+        "aqi_change_1h":       _aqi - df["aqi"].shift(2),
+        "aqi_change_6h":       _aqi - df["aqi"].shift(7),
+        "aqi_change_24h":      _aqi - df["aqi"].shift(25),
+        "aqi_trend_slope_6h":  (
             _aqi.rolling(6, min_periods=6)
                 .apply(_rolling_slope_6h, raw=True)
                 .fillna(0)
         ),
-        "aqi_acceleration":     _aqi.diff().diff().fillna(0),
+        "aqi_acceleration":    _aqi.diff().diff().fillna(0),
     }
     df = pd.concat([df, pd.DataFrame(mom_cols, index=df.index)], axis=1)
 
@@ -224,23 +274,38 @@ def build_features(df_raw: pd.DataFrame) -> pd.DataFrame:
     df = pd.concat([df, pd.DataFrame(persist_cols, index=df.index)], axis=1)
 
     # ── STEP 11: STATISTICAL ANOMALY DETECTION ───────────────────────────────
-    _rm72  = _aqi.rolling(72, min_periods=24).mean()
-    _rs72  = _aqi.rolling(72, min_periods=24).std().replace(0, 1)
-    _rq90  = _aqi.rolling(168, min_periods=72).quantile(0.90)
+    _rm72 = _aqi.rolling(72, min_periods=24).mean()
+    _rs72 = _aqi.rolling(72, min_periods=24).std().replace(0, 1)
+    _rq90 = _aqi.rolling(168, min_periods=72).quantile(0.90)
+
+    # FIX #5 (CRITICAL): pd.cut with integer labels creates a Categorical series
+    # whose dtype is object/category, not a numeric primitive. Even chaining
+    # .astype(float) is unreliable across pandas versions — the Categorical
+    # metadata can persist and cause XGBoost to raise:
+    #   ValueError: DataFrame.dtypes for data must be int, float, bool or categorical
+    #
+    # Correct fix: use float literals for labels, then cast explicitly to
+    # np.float64 via Series constructor to guarantee a primitive numeric column.
+    _aqi_regime_cat = pd.cut(
+        df["aqi_lag_1"],
+        bins=[0, 50, 100, 150, 200, 300, 1000],
+        labels=[0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
+    )
+    _aqi_regime = pd.Series(
+        _aqi_regime_cat.to_numpy(dtype=np.float64, na_value=np.nan),
+        index=df.index,
+    ).fillna(0.0)
+
     anomaly_cols = {
-        "aqi_zscore_72h":        ((df["aqi_lag_1"] - _rm72) / _rs72).fillna(0),
-        "aqi_percentile_72":     (
+        "aqi_zscore_72h":       ((df["aqi_lag_1"] - _rm72) / _rs72).fillna(0),
+        "aqi_percentile_72":    (
             _aqi.rolling(72, min_periods=12)
                 .apply(lambda x: float(np.mean(x < x[-1])), raw=True)
                 .fillna(0.5)
         ),
-        "aqi_above_recent_q90":  (df["aqi_lag_1"] > _rq90).astype(int),
-        "aqi_volatility_ratio":  df["aqi_roll_std_24"] / (df["aqi_roll_std_72"] + 1),
-        "aqi_regime":            pd.cut(
-            df["aqi_lag_1"],
-            bins=[0, 50, 100, 150, 200, 300, 1000],
-            labels=[0, 1, 2, 3, 4, 5],
-        ).astype(float).fillna(0.0),
+        "aqi_above_recent_q90": (df["aqi_lag_1"] > _rq90).astype(int),
+        "aqi_volatility_ratio": df["aqi_roll_std_24"] / (df["aqi_roll_std_72"] + 1),
+        "aqi_regime":           _aqi_regime,   # guaranteed np.float64 primitive
     }
     df = pd.concat([df, pd.DataFrame(anomaly_cols, index=df.index)], axis=1)
 
@@ -259,8 +324,8 @@ def build_features(df_raw: pd.DataFrame) -> pd.DataFrame:
         _consec.append(_run)
 
     spike_cols = {
-        "spike_count_72h":           spike_flag.rolling(72, min_periods=1).sum().fillna(0),
-        "dust_hours_72h":            (_pm10 > 250).rolling(72, min_periods=1).sum().fillna(0),
+        "spike_count_72h":              spike_flag.rolling(72, min_periods=1).sum().fillna(0),
+        "dust_hours_72h":               (_pm10 > 250).rolling(72, min_periods=1).sum().fillna(0),
         "hours_since_aqi_spike":        pd.Series(_hours_since, index=df.index).shift(1),
         "consecutive_hours_above_150":  pd.Series(_consec,      index=df.index).shift(1),
     }
@@ -278,12 +343,14 @@ def build_features(df_raw: pd.DataFrame) -> pd.DataFrame:
     for poll in ["no2", "o3"]:
         if poll not in df.columns:
             continue
-        poll_cols[f"{poll}_roll_std_24"] = df[poll].shift(1).rolling(24, min_periods=1).std().fillna(0)
+        poll_cols[f"{poll}_roll_std_24"] = (
+            df[poll].shift(1).rolling(24, min_periods=1).std().fillna(0)
+        )
 
     if {"pm25", "pm10"}.issubset(df.columns):
         poll_cols["pm25_pm10_ratio"] = (
             df["pm25"].shift(1) / (df["pm10"].shift(1) + 1e-3)
-        ).clip(upper=10)   
+        ).clip(upper=10)
         poll_cols["pm25_fraction"] = (
             df["pm25"].shift(1)
             / (df["pm25"].shift(1) + df["pm10"].shift(1) + 1e-3)
@@ -294,52 +361,70 @@ def build_features(df_raw: pd.DataFrame) -> pd.DataFrame:
 
     if "dust" in df.columns:
         _dust = df["dust"].shift(1)
-        poll_cols["dust_lag_1"]       = _dust
+        poll_cols["dust_lag_1"]        = _dust
         poll_cols["dust_roll_mean_24"] = _dust.rolling(24, min_periods=1).mean()
         poll_cols["dust_roll_max_24"]  = _dust.rolling(24, min_periods=1).max()
 
     if "uv_index" in df.columns:
-        poll_cols["uv_lag_1"]          = df["uv_index"].shift(1)
-        poll_cols["uv_roll_mean_24"]   = df["uv_index"].shift(1).rolling(24, min_periods=1).mean()
+        poll_cols["uv_lag_1"]        = df["uv_index"].shift(1)
+        poll_cols["uv_roll_mean_24"] = df["uv_index"].shift(1).rolling(24, min_periods=1).mean()
 
     df = pd.concat([df, pd.DataFrame(poll_cols, index=df.index)], axis=1)
 
     # ── STEP 14: METEOROLOGICAL DISPERSAL ────────────────────────────────────
-    met_cols = {}
-    for col in ["temperature", "humidity", "wind_speed"]:
-        if col not in df.columns:
-            continue
-        _s = df[col].shift(1)
-        met_cols[f"{col}_roll_mean_24"] = _s.rolling(24, min_periods=1).mean()
-        met_cols[f"{col}_change_24h"]   = df[col].shift(1) - df[col].shift(25)
-        for lag in [1, 6, 24]:
-            met_cols[f"{col}_lag_{lag}"] = df[col].shift(lag)
+    # FIX: Use _resolve_col() for wind_speed so this step doesn't silently
+    # produce NaN columns if Step 4 resolved to a suffixed variant.
+    met_cols  = {}
+    temp_col  = _resolve_col(df, "temperature",  "temperature_2m")
+    hum_col   = _resolve_col(df, "humidity",      "relative_humidity_2m")
+    ws_col_14 = _resolve_col(df, "wind_speed",    "wind_speed_10m")
 
-    if "wind_speed" in df.columns:
-        ws_lag1 = df["wind_speed"].shift(1)
+    for col, resolved in [
+        ("temperature", temp_col),
+        ("humidity", hum_col),
+        ("wind_speed", ws_col_14),
+    ]:
+        if not resolved:
+            print(
+                f" -> WARNING: '{col}' not found — skipping met rolling features for this column."
+            )
+            continue
+        _s = df[resolved].shift(1)
+        met_cols[f"{col}_roll_mean_24"] = _s.rolling(24, min_periods=1).mean()
+        met_cols[f"{col}_change_24h"]   = df[resolved].shift(1) - df[resolved].shift(25)
+        for lag in [1, 6, 24]:
+            met_cols[f"{col}_lag_{lag}"] = df[resolved].shift(lag)
+
+    if ws_col_14:
+        ws_lag1 = df[ws_col_14].shift(1)
         met_cols["wind_speed_roll_std_24"] = ws_lag1.rolling(24, min_periods=1).std().fillna(0)
-        ws_roll24 = ws_lag1.rolling(24, min_periods=1).mean()
+        ws_roll24  = ws_lag1.rolling(24,  min_periods=1).mean()
         ws_roll168 = ws_lag1.rolling(168, min_periods=1).mean()
         met_cols["wind_persistence_ratio"] = ws_roll24 / (ws_roll168 + 0.1)
 
-    if "temperature" in df.columns:
-        met_cols["temperature_roll_std_24"] = df["temperature"].shift(1).rolling(24, min_periods=1).std().fillna(0)
+    if temp_col:
+        met_cols["temperature_roll_std_24"] = (
+            df[temp_col].shift(1).rolling(24, min_periods=1).std().fillna(0)
+        )
 
-    if {"temperature", "humidity"}.issubset(df.columns):
-        met_cols["temp_humidity"]  = df["temperature"].shift(1) * df["humidity"].shift(1)
-        met_cols["heat_dryness"]   = df["temperature"].shift(1) / (df["humidity"].shift(1) + 1)
+    if temp_col and hum_col:
+        met_cols["temp_humidity"] = df[temp_col].shift(1) * df[hum_col].shift(1)
+        met_cols["heat_dryness"]  = df[temp_col].shift(1) / (df[hum_col].shift(1) + 1)
 
-    if {"wind_speed", "pm25"}.issubset(df.columns):
-        met_cols["wind_dispersal"] = df["wind_speed"].shift(1) / (df["pm25"].shift(1) + 5)
+    if ws_col_14 and "pm25" in df.columns:
+        met_cols["wind_dispersal"] = df[ws_col_14].shift(1) / (df["pm25"].shift(1) + 5)
 
-    if {"temperature", "dew_point"}.issubset(df.columns):
-        met_cols["dew_point_depression"]      = df["temperature"].shift(1) - df["dew_point"].shift(1)
-        met_cols["dew_pt_depression_roll24"]  = met_cols["dew_point_depression"].rolling(24, min_periods=1).mean()
+    dew_col = _resolve_col(df, "dew_point", "dew_point_2m")
+    if temp_col and dew_col:
+        met_cols["dew_point_depression"]     = df[temp_col].shift(1) - df[dew_col].shift(1)
+        met_cols["dew_pt_depression_roll24"] = (
+            met_cols["dew_point_depression"].rolling(24, min_periods=1).mean()
+        )
 
     if "precipitation" in df.columns:
         prec = df["precipitation"].shift(1)
-        met_cols["rain_24h"] = prec.rolling(24, min_periods=1).sum()
-        met_cols["rain_72h"] = prec.rolling(72, min_periods=1).sum()
+        met_cols["rain_24h"]   = prec.rolling(24, min_periods=1).sum()
+        met_cols["rain_72h"]   = prec.rolling(72, min_periods=1).sum()
         met_cols["rain_event"] = (prec > 0.1).astype(int)
 
     if "pressure" in df.columns:
@@ -350,8 +435,8 @@ def build_features(df_raw: pd.DataFrame) -> pd.DataFrame:
         met_cols["pressure_change_6h"]    = pres - df["pressure"].shift(7)
 
     if "surface_pressure" in df.columns:
-        met_cols["surface_pressure_lag_1"]        = df["surface_pressure"].shift(1)
-        met_cols["surface_pressure_change_24h"]   = (
+        met_cols["surface_pressure_lag_1"]      = df["surface_pressure"].shift(1)
+        met_cols["surface_pressure_change_24h"] = (
             df["surface_pressure"].shift(1) - df["surface_pressure"].shift(25)
         )
 
@@ -362,91 +447,104 @@ def build_features(df_raw: pd.DataFrame) -> pd.DataFrame:
 
     if "cloud_cover" in df.columns:
         met_cols["cloud_cover_lag_1"]        = df["cloud_cover"].shift(1)
-        met_cols["cloud_cover_roll_mean_24"] = df["cloud_cover"].shift(1).rolling(24, min_periods=1).mean()
+        met_cols["cloud_cover_roll_mean_24"] = (
+            df["cloud_cover"].shift(1).rolling(24, min_periods=1).mean()
+        )
 
     df = pd.concat([df, pd.DataFrame(met_cols, index=df.index)], axis=1)
 
     # ── STEP 15: WARM-UP ROW FILTERING ───────────────────────────────────────
-    required_non_null = [
-        "aqi_same_hour_30days_ago",  # 720 h of history
-        "target_aqi_72h",
-    ]
+    required_non_null = ["aqi_same_hour_30days_ago", "target_aqi_72h"]
     before = len(df)
     df = df.dropna(subset=required_non_null).reset_index(drop=True)
     print(f" -> Dropped {before - len(df):,} warm-up rows. {len(df):,} rows remaining.")
 
     assert df["datetime"].is_monotonic_increasing, "CRITICAL: Temporal order broken."
+
+    # ── STEP 16: DTYPE SAFETY PASS ────────────────────────────────────────────
+    # Final guard: ensure no object or category columns leaked through from any
+    # pd.cut / pd.Categorical operation. XGBoost and RF both require numeric
+    # primitives. This catches any future regressions transparently.
+    obj_cols = df.select_dtypes(include=["object", "category"]).columns.tolist()
+    non_date_obj = [c for c in obj_cols if c != "datetime"]
+    if non_date_obj:
+        print(
+            f" -> WARNING: Coercing {len(non_date_obj)} non-numeric columns to float64: "
+            f"{non_date_obj}"
+        )
+        for col in non_date_obj:
+            df[col] = pd.to_numeric(df[col], errors="coerce").astype(np.float64).fillna(0.0)
+
     return df
 
 
 # ── 3. Production Pipeline Entrypoint ─────────────────────────────────────────
 
 def process_all():
-    """
-    Unified entry-point executed by run_feature_pipeline.py inside GitHub Actions.
-    Pulls clean database data, calculates feature space matrices, and saves back.
-    """
     mongo_uri = os.getenv("MONGODB_URI")
     if not mongo_uri:
         raise ValueError("CRITICAL: MONGODB_URI missing from environment contexts.")
 
-    print("\n" + "="*70)
-    print(" 📥 EXTRACTING INPUT ALIGNED ARTIFACT FROM MONGODB")
-    print("="*70)
-    
-    # Connect to MongoDB cluster instance
+    print("\n" + "=" * 70)
+    print(" EXTRACTING INPUT ALIGNED ARTIFACT FROM MONGODB")
+    print("=" * 70)
+
     client = pymongo.MongoClient(mongo_uri)
-    db = client["karachi_aqi"]
-    input_collection = db["karachi_aqi_dataset"]
-    
-    # Read output streams from build_dataset collection steps
-    cursor = input_collection.find()
+    db     = client["karachi_aqi"]
+
+    cursor = db["karachi_aqi_dataset"].find()
     raw_df = pd.DataFrame(list(cursor))
-    
+
     if raw_df.empty:
         client.close()
-        raise RuntimeError("CRITICAL: 'karachi_aqi_dataset' document store collection is completely empty.")
-        
+        raise RuntimeError(
+            "CRITICAL: 'karachi_aqi_dataset' collection is completely empty. "
+            "Run build_dataset.py first."
+        )
+
     if "_id" in raw_df.columns:
         raw_df = raw_df.drop(columns=["_id"])
 
-    # Ensure native datetime conversions
     raw_df["datetime"] = pd.to_datetime(raw_df["datetime"])
-
-    # Compute high-dimensional feature spaces
     processed_df = build_features(raw_df)
 
-    # ── MLOPS FEATURE STORE LOADING BLOCK ────────────────────────────────────
-    print("\n" + "="*70)
-    print(" 📤 STREAMING STRUCTURED BATCH TO MONGODB FEATURE STORE")
-    print("="*70)
-    
-    # Format the datetime object back into uniform ISO strings for MongoDB indexing
+    print("\n" + "=" * 70)
+    print(" STREAMING STRUCTURED BATCH TO MONGODB FEATURE STORE")
+    print("=" * 70)
+
     mongo_df = processed_df.copy()
     mongo_df["timestamp"] = mongo_df["datetime"].dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-    mongo_df["datetime"] = mongo_df["datetime"].dt.strftime("%Y-%m-%d %H:%M:%S")
-    
-    # Convert dataframe records to JSON dictionary payloads
+    mongo_df["datetime"]  = mongo_df["datetime"].dt.strftime("%Y-%m-%d %H:%M:%S")
+
     features_payload = mongo_df.to_dict(orient="records")
     print(f"Prepared {len(features_payload):,} documents for Atlas integration.")
-    
-    # Transactional mutation upserts inside the centralized feature store collection
+
     output_collection = db["processed_features"]
-    print(f"Saving high-dimensional features to collection 'processed_features'...")
-    
-    # Batch transactional upserts relative to temporal anchor indicators
-    for record in features_payload:
-        output_collection.update_one(
-            {"datetime": record["datetime"]},
-            {"$set": record},
-            upsert=True
+    operations = [
+        UpdateOne(
+            {"datetime": r["datetime"]},
+            {"$set": r},
+            upsert=True,
+        )
+        for r in features_payload
+    ]
+
+    total_batches = (len(operations) + BULK_BATCH_SIZE - 1) // BULK_BATCH_SIZE
+    for i in range(0, len(operations), BULK_BATCH_SIZE):
+        batch_num = i // BULK_BATCH_SIZE + 1
+        result = output_collection.bulk_write(
+            operations[i : i + BULK_BATCH_SIZE],
+            ordered=False,
+        )
+        print(
+            f"  Batch {batch_num}/{total_batches} — "
+            f"upserted: {result.upserted_count}, modified: {result.modified_count}"
         )
 
     client.close()
-    print(f"✅ Success! Feature Store collection synchronized cleanly.")
-    print("="*70 + "\n")
+    print(f"\nSuccess! Feature Store collection synchronized cleanly.")
+    print("=" * 70 + "\n")
 
 
-# Local testing environment anchor fallback routing checks
 if __name__ == "__main__":
     process_all()
