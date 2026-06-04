@@ -102,16 +102,17 @@ def run_evaluation_suite():
         print(f"🏆 Winning Engine ({horizon_key}): {compiled_horizons[horizon_key]['Winning_Model']}")
         print("-" * 95)
 
-    # 4. Push complete production payload structure directly into 'processed_features' collection
+    # 4. Push complete production payload structure directly into a dedicated metrics collection
     try:
         payload = {
             "type": "automated_pipeline_evaluation",
-            "timestamp": pd.Timestamp.now().to_pydatetime(),
+            "timestamp": pd.Timestamp.now(tz="UTC").to_pydatetime(),  # Keep timestamps timezone-aware
             "pipeline_run_status": "SUCCESS",
             "performance_summary": compiled_horizons
         }
         
-        db["processed_features"].insert_one(payload)
+        # FIXED: Routing performance telemetry away from features matrix to isolated warehouse
+        db["model_metrics"].insert_one(payload)
         print("🚀 Performance history record successfully pushed to MongoDB Atlas.")
     except Exception as e:
         print(f"⚠️ Could not log metrics to database: {e}")

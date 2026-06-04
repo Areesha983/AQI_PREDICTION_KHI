@@ -6,6 +6,7 @@ Streamlit frontend consuming a Flask prediction microservice.
 import streamlit as st
 import pandas as pd
 import requests
+import pymongo  # Added to prevent NameError on sorting parameters
 
 from alerts import get_epa_tier_details
 from visualizations import plot_error_progression, plot_variance_matrix, plot_aqi_gauge
@@ -332,13 +333,12 @@ for idx, m_key in enumerate(all_models):
         st.markdown(f'<div style="margin-top:8px;">{cards_html}</div>', unsafe_allow_html=True)
 
 
-# ─── SECTION 3: MODEL EVALUATION CHARTS ──────────────────────────────────────
 # ─── SECTION 3: MODEL EVALUATION CHARTS (UPDATED FOR MONGODB) ─────────────────
 st.markdown("<hr>", unsafe_allow_html=True)
 st.markdown("### 📊 Live Model Evaluation Metrics")
 st.caption("Dynamic performance telemetry ($R^2$, RMSE, Coverage) synchronized directly from your MongoDB Atlas MLOps history store.")
 
-@st.cache_data(ttl=30) # Cache for 30 seconds to prevent hammering your DB on slider moves
+@st.cache_data(ttl=30)  # Cache for 30 seconds to prevent hammering your DB on slider moves
 def _fetch_metrics_from_mongodb() -> pd.DataFrame:
     rows = []
     default_models = ["Random Forest", "XGBoost", "Ridge"]
@@ -354,13 +354,12 @@ def _fetch_metrics_from_mongodb() -> pd.DataFrame:
         
     try:
         # Import your existing client/connection details 
-        # (Assuming your database.py module exposes your MongoDB client or collection connection)
         from database import db 
         
-        # Query the latest evaluation record pushed by evaluate.py
-        latest_record = db["processed_features"].find_one(
+        # Query the latest evaluation record pushed by evaluate.py into 'model_metrics'
+        latest_record = db["model_metrics"].find_one(
             {"type": "automated_pipeline_evaluation"},
-            sort=[("timestamp", pymongo.DESCENDING if "pymongo" in globals() else -1)]
+            sort=[("timestamp", pymongo.DESCENDING)]
         )
         
         if latest_record and "performance_summary" in latest_record:
@@ -377,8 +376,7 @@ def _fetch_metrics_from_mongodb() -> pd.DataFrame:
                     # Safely map metrics with fallback parameters
                     r2 = m_stats.get("R2") or m_stats.get("test_r2") or 0.0
                     
-                    # If your training pipeline saves MAE/MAPE instead of RMSE, 
-                    # fallback to MAE so your charts don't render empty values
+                    # If your training pipeline saves MAE/MAPE instead of RMSE, fallback to MAE
                     rmse = m_stats.get("RMSE") or m_stats.get("MAE") or 0.0
                     coverage = m_stats.get("Coverage") or 0.0
                     
