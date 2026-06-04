@@ -33,26 +33,13 @@ jobs:
         env:
           MONGODB_URI: ${{ secrets.MONGO_CONNECTION_STRING }}
         run: |
-          echo "🤖 Entering training directory and launching pipeline algorithms sequentially..."
-          # By using 'cd training_pipeline', python natively resolves 'from load_data import ...' perfectly!
-          cd training_pipeline
-          
-          echo "📥 Pulling data from Feature Store via load_data.py..."
-          python load_data.py
-          
-          echo "🤖 Training Random Forest Regressor..."
-          python train_random_forest.py
-          
-          echo "📉 Training Ridge Regressor..."
-          python train_ridge.py
-          
-          echo "⚡ Training XGBoost Regressor..."
-          python train_xgboost.py
+          echo "🤖 Launching self-contained master training pipeline wrapper..."
+          python run_training_pipeline.py
 
       - name: Evaluate Model Performance Metrics
         env:
           MONGODB_URI: ${{ secrets.MONGO_CONNECTION_STRING }}
+          PYTHONPATH: ".:training_pipeline"
         run: |
           echo "📊 Evaluating model performance metrics..."
-          cd training_pipeline
-          python evaluate.py
+          python training_pipeline/evaluate.py
