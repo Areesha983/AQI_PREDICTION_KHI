@@ -34,17 +34,13 @@ jobs:
           # Injects your secured connection string to pull from 'processed_features'
           MONGODB_URI: ${{ secrets.MONGO_CONNECTION_STRING }}
         run: |
-          echo "📥 Pulling data from Feature Store via load_data.py..."
-          python training_pipeline/load_data.py
-          
-          echo "🤖 Training Random Forest Regressor..."
-          python training_pipeline/train_random_forest.py
-          
-          echo "📉 Training Ridge Regressor..."
-          python training_pipeline/train_ridge.py
-          
-          echo "⚡ Training XGBoost Regressor..."
-          python training_pipeline/train_xgboost.py
-          
+          # Use your master wrapper script to cleanly load data and train all models
+          python run_training_pipeline.py
+
+      - name: Evaluate Model Performance Metrics
+        env:
+          MONGODB_URI: ${{ secrets.MONGO_CONNECTION_STRING }}
+        run: |
           echo "📊 Evaluating model performance metrics..."
-          python training_pipeline/evaluate.py
+          # PYTHONPATH=. guarantees python resolves imports from the repo root directory
+          PYTHONPATH=. python training_pipeline/evaluate.py

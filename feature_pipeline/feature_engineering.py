@@ -26,9 +26,26 @@ FIXES APPLIED:
     dtype is object/category, not a numeric primitive. Even though .astype(float)
     was chained, on some pandas versions the Categorical metadata is preserved and
     XGBoost raises ValueError: DataFrame.dtypes for data must be int, float, bool
-    or categorical. Fixed by casting labels to float literals [0.0 … 5.0] and
+    or categorical. Fixed by casting labels to float literals [0.0 ... 5.0] and
     explicitly converting via .cat.codes or np.float64 cast to guarantee a
     primitive numeric array reaches the feature matrix.
+
+  R2 IMPROVEMENTS (added after original bug fixes):
+    FEAT #1: human_emissions_proxy — explicit float weight encoding weekday/rush-hour
+      activity patterns. More informative than the binary is_rush_hour flag alone.
+
+    FEAT #2: Meteorological stagnation features — diurnal_temp_range_24h,
+      temp_to_wind_ratio, humidity_to_wind_ratio, and is_atmospheric_stagnant.
+      These encode the physical mechanism by which PM2.5 gets trapped under
+      low-wind, high-humidity conditions. Tree models cannot derive these ratios
+      on their own; making them explicit significantly reduces split depth needed.
+
+    FEAT #3: Target deviation targets — target_aqi_{h}h_deviation = future_aqi
+      minus a 7-day rolling median anchor for that exact hour. These mean-reverting
+      targets are more stationary than raw absolute AQI, which helps the 48h/72h
+      models escape the scale-extrapolation trap that limits tree-based R2.
+      NOTE: evaluation code in train_*.py must add aqi_historical_anchor back to
+      predicted deltas before computing MAE / RMSE / R2 against raw AQI.
 """
 
 import os
@@ -110,9 +127,6 @@ def build_features(df_raw: pd.DataFrame) -> pd.DataFrame:
     print(f"Initializing primary transformations. Input shape: {df.shape}")
 
     # ── STEP 1: LEAKAGE-FREE CAUSAL IMPUTATION ────────────────────────────────
-    # FIX: Was interpolate(method="time").ffill() — fills gaps using FUTURE
-    # anchor values. ffill() is strictly causal.
-    # bfill(limit=1) only patches leading NaNs at the very head of the series.
     df = df.set_index("datetime")
     num_cols = df.select_dtypes(include=np.number).columns
     df[num_cols] = df[num_cols].ffill().bfill(limit=1)
@@ -120,7 +134,6 @@ def build_features(df_raw: pd.DataFrame) -> pd.DataFrame:
     print(" -> Causal imputation complete (ffill only — no future leakage).")
 
     # ── STEP 2: AQI COMPUTATION + MULTI-HORIZON TARGETS ──────────────────────
-    # Computed from cleanly forward-filled pm25 only (no future contamination).
     df["aqi"] = df["pm25"].apply(calculate_aqi_from_pm25)
 
     new_cols = {}
@@ -128,6 +141,27 @@ def build_features(df_raw: pd.DataFrame) -> pd.DataFrame:
         new_cols[f"target_aqi_{h}h"]     = df["aqi"].shift(-h)
         new_cols[f"target_aqi_{h}h_log"] = np.log1p(new_cols[f"target_aqi_{h}h"])
         new_cols[f"target_cat_{h}h"]     = new_cols[f"target_aqi_{h}h"].apply(aqi_to_category)
+
+    # FEAT #3: Target deviation targets
+    # A 7-day (168h) rolling median anchored at the previous hour gives a causal
+    # structural baseline for "what AQI typically looks like at this time of week".
+    # Predicting the deviation (future - baseline) yields a more stationary target
+    # that tree models handle better at 48h/72h horizons.
+    # ⚠️  IMPORTANT: in train_xgboost.py / train_random_forest.py / train_ridge.py,
+    # add back df["aqi_historical_anchor"] to predicted deltas before computing
+    # MAE, RMSE, and R2 against raw AQI values.
+    aqi_historical_anchor = (
+        df["aqi"].shift(1)
+        .rolling(168, min_periods=24)
+        .median()
+        .fillna(df["aqi"].median())
+    )
+    new_cols["aqi_historical_anchor"] = aqi_historical_anchor
+
+    for h in [12, 24, 48, 72]:
+        future_aqi = df["aqi"].shift(-h)
+        new_cols[f"target_aqi_{h}h_deviation"] = future_aqi - aqi_historical_anchor
+
     df = pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
 
     # ── STEP 3: TEMPORAL EMBEDDINGS ───────────────────────────────────────────
@@ -156,12 +190,18 @@ def build_features(df_raw: pd.DataFrame) -> pd.DataFrame:
         "is_weekend":   (weekday >= 5).astype(int),
         "is_rush_hour": hour.isin([7, 8, 9, 17, 18, 19]).astype(int),
         "hour_of_week": weekday * 24 + hour,
+        # FEAT #1: human_emissions_proxy
+        # Explicit float weight: 1.0 = weekday rush hour, 0.7 = weekday off-peak,
+        # 0.3 = weekend. More granular than a binary flag; lets tree models segment
+        # Karachi's port + industrial + traffic emission cycles directly.
+        "human_emissions_proxy": np.where(
+            (weekday < 5) & hour.isin([8, 9, 17, 18, 19]), 1.0,
+            np.where(weekday < 5, 0.7, 0.3)
+        ),
     }
     df = pd.concat([df, pd.DataFrame(temp_cols, index=df.index)], axis=1)
 
     # ── STEP 4: WIND VECTOR DECOMPOSITION ────────────────────────────────────
-    # FIX: Use _resolve_col() to handle both "wind_speed" and "wind_speed_10m"
-    # so a future API column rename doesn't silently skip this entire step.
     ws_col = _resolve_col(df, "wind_speed",     "wind_speed_10m")
     wd_col = _resolve_col(df, "wind_direction",  "wind_direction_10m")
 
@@ -278,14 +318,6 @@ def build_features(df_raw: pd.DataFrame) -> pd.DataFrame:
     _rs72 = _aqi.rolling(72, min_periods=24).std().replace(0, 1)
     _rq90 = _aqi.rolling(168, min_periods=72).quantile(0.90)
 
-    # FIX #5 (CRITICAL): pd.cut with integer labels creates a Categorical series
-    # whose dtype is object/category, not a numeric primitive. Even chaining
-    # .astype(float) is unreliable across pandas versions — the Categorical
-    # metadata can persist and cause XGBoost to raise:
-    #   ValueError: DataFrame.dtypes for data must be int, float, bool or categorical
-    #
-    # Correct fix: use float literals for labels, then cast explicitly to
-    # np.float64 via Series constructor to guarantee a primitive numeric column.
     _aqi_regime_cat = pd.cut(
         df["aqi_lag_1"],
         bins=[0, 50, 100, 150, 200, 300, 1000],
@@ -305,7 +337,7 @@ def build_features(df_raw: pd.DataFrame) -> pd.DataFrame:
         ),
         "aqi_above_recent_q90": (df["aqi_lag_1"] > _rq90).astype(int),
         "aqi_volatility_ratio": df["aqi_roll_std_24"] / (df["aqi_roll_std_72"] + 1),
-        "aqi_regime":           _aqi_regime,   # guaranteed np.float64 primitive
+        "aqi_regime":           _aqi_regime,
     }
     df = pd.concat([df, pd.DataFrame(anomaly_cols, index=df.index)], axis=1)
 
@@ -372,8 +404,6 @@ def build_features(df_raw: pd.DataFrame) -> pd.DataFrame:
     df = pd.concat([df, pd.DataFrame(poll_cols, index=df.index)], axis=1)
 
     # ── STEP 14: METEOROLOGICAL DISPERSAL ────────────────────────────────────
-    # FIX: Use _resolve_col() for wind_speed so this step doesn't silently
-    # produce NaN columns if Step 4 resolved to a suffixed variant.
     met_cols  = {}
     temp_col  = _resolve_col(df, "temperature",  "temperature_2m")
     hum_col   = _resolve_col(df, "humidity",      "relative_humidity_2m")
@@ -421,6 +451,32 @@ def build_features(df_raw: pd.DataFrame) -> pd.DataFrame:
             met_cols["dew_point_depression"].rolling(24, min_periods=1).mean()
         )
 
+    # FEAT #2: Atmospheric stagnation features
+    # Physical motivation: when wind drops below ~2 m/s AND the dew-point
+    # depression is small (air nearly saturated), the planetary boundary layer
+    # collapses and PM2.5 cannot disperse. Making these interactions explicit
+    # drastically reduces the split depth that tree models need to discover them.
+    if temp_col and hum_col and ws_col_14:
+        t_lag1 = df[temp_col].shift(1)
+        ws_lag1_stag = df[ws_col_14].shift(1)
+
+        # 24h diurnal temperature range: low range = stagnant air mass
+        met_cols["diurnal_temp_range_24h"] = (
+            t_lag1.rolling(24, min_periods=6).max()
+            - t_lag1.rolling(24, min_periods=6).min()
+        ).bfill()
+
+        # Ratio features: force the model to see the interaction directly
+        met_cols["temp_to_wind_ratio"]     = t_lag1 / (ws_lag1_stag + 0.1)
+        met_cols["humidity_to_wind_ratio"] = df[hum_col].shift(1) / (ws_lag1_stag + 0.1)
+
+        # Hard binary stagnation trigger: wind < 2 m/s AND nearly saturated air
+        # Only defined when dew_point_depression was already computed above
+        if "dew_point_depression" in met_cols:
+            met_cols["is_atmospheric_stagnant"] = (
+                (ws_lag1_stag < 2.0) & (met_cols["dew_point_depression"] < 3.0)
+            ).astype(float)
+
     if "precipitation" in df.columns:
         prec = df["precipitation"].shift(1)
         met_cols["rain_24h"]   = prec.rolling(24, min_periods=1).sum()
@@ -462,9 +518,6 @@ def build_features(df_raw: pd.DataFrame) -> pd.DataFrame:
     assert df["datetime"].is_monotonic_increasing, "CRITICAL: Temporal order broken."
 
     # ── STEP 16: DTYPE SAFETY PASS ────────────────────────────────────────────
-    # Final guard: ensure no object or category columns leaked through from any
-    # pd.cut / pd.Categorical operation. XGBoost and RF both require numeric
-    # primitives. This catches any future regressions transparently.
     obj_cols = df.select_dtypes(include=["object", "category"]).columns.tolist()
     non_date_obj = [c for c in obj_cols if c != "datetime"]
     if non_date_obj:

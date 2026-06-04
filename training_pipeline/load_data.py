@@ -78,6 +78,10 @@ ALL_TARGETS = [
     "target_aqi_12h", "target_aqi_24h", "target_aqi_48h", "target_aqi_72h",
     "target_aqi_12h_log", "target_aqi_24h_log", "target_aqi_48h_log", "target_aqi_72h_log",
     "target_cat_12h", "target_cat_24h", "target_cat_48h", "target_cat_72h",
+    # Deviation targets added by feature_engineering.py — must be excluded from X
+    # or they will leak future AQI information directly into the feature matrix.
+    "target_aqi_12h_deviation", "target_aqi_24h_deviation",
+    "target_aqi_48h_deviation", "target_aqi_72h_deviation",
 ]
 BASE_DROP     = ["datetime", "timestamp"] + REDUNDANT_TIME_COLS + ALL_TARGETS
 LEAKAGE_EXACT = frozenset(ALL_TARGETS)

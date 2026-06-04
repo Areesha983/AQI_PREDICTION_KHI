@@ -5,7 +5,7 @@ Handles authenticated stream ingestion and historical analytics matrix extractio
 import os
 from pathlib import Path
 import pandas as pd
-from pymongo import MongoClient
+from pymongo import MongoClient, UpdateOne
 from pymongo.errors import PyMongoError
 from dotenv import load_dotenv
 
@@ -44,30 +44,42 @@ def ingest_hourly_features(features_payload: list[dict]) -> int:
     
     # Create a unique index on timestamp to prevent duplicate records
     collection.create_index("timestamp", unique=True)
-    
-    inserted_count = 0
-    for doc in features_payload:
-        if "timestamp" not in doc:
-            print("WARNING: Skipped document missing index anchor field: 'timestamp'")
-            continue
-        try:
-            # Handle potential NaN to string mapping conversions or conversions MongoDB dislikes
-            # Replace numpy nan/inf with None so they translate cleanly to Null in Mongo
-            clean_doc = {k: (None if isinstance(v, float) and pd.isna(v) else v) for k, v in doc.items()}
-            
-            # Upsert operations update existing matching keys or insert if new
-            result = collection.update_one(
-                {"timestamp": clean_doc["timestamp"]},
-                {"$set": clean_doc},
-                upsert=True
-            )
-            if result.upserted_id or result.modified_count > 0:
-                inserted_count += 1
-        except PyMongoError as e:
-            print(f"Database error executing document record mutation: {e}")
-            
+
+    # Clean docs: replace numpy nan/inf with None so MongoDB accepts them cleanly
+    clean_docs = [
+        {k: (None if isinstance(v, float) and pd.isna(v) else v) for k, v in doc.items()}
+        for doc in features_payload
+        if "timestamp" in doc
+    ]
+    skipped = len(features_payload) - len(clean_docs)
+    if skipped:
+        print(f"WARNING: Skipped {skipped} documents missing 'timestamp' field.")
+
+    if not clean_docs:
+        client.close()
+        return 0
+
+    # FIX: was row-by-row update_one() — for large payloads that's ~50 min of
+    # network round-trips. bulk_write() batches 1000 ops per round-trip.
+    BULK_BATCH_SIZE = 1000
+    operations = [
+        UpdateOne({"timestamp": doc["timestamp"]}, {"$set": doc}, upsert=True)
+        for doc in clean_docs
+    ]
+
+    total_written = 0
+    total_batches = (len(operations) + BULK_BATCH_SIZE - 1) // BULK_BATCH_SIZE
+    for i in range(0, len(operations), BULK_BATCH_SIZE):
+        batch_num = i // BULK_BATCH_SIZE + 1
+        result = collection.bulk_write(
+            operations[i : i + BULK_BATCH_SIZE], ordered=False
+        )
+        written = result.upserted_count + result.modified_count
+        total_written += written
+        print(f"  Batch {batch_num}/{total_batches} — upserted: {result.upserted_count}, modified: {result.modified_count}")
+
     client.close()
-    return inserted_count
+    return total_written
 
 def extract_historical_feature_matrix() -> pd.DataFrame:
     """

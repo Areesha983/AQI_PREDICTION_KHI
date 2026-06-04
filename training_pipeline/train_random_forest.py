@@ -162,7 +162,11 @@ def train_rf(horizon: int) -> dict:
         "max_depth":         [12, 18, 25, None],
         "min_samples_leaf":  [3, 5, 8],
         "min_samples_split": [6, 10, 14],
-        "max_features":      ["sqrt", 0.5],
+        # FIX: 'sqrt' on 150+ features tests only ~12 cols per split — too few to
+        # reliably select the new stagnation / deviation features. Fractional values
+        # give the search a much better chance of finding the right splits.
+        # 0.5 was too high (overfitting risk); 0.2–0.4 is the right band.
+        "max_features":      [0.2, 0.3, 0.4],
     }
     base_rf   = RandomForestRegressor(random_state=42, n_jobs=-1)
     tuning_cv = TimeSeriesSplit(n_splits=3, gap=horizon)

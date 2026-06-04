@@ -41,6 +41,7 @@ from load_data import (
     compute_aqi_event_metrics,
     export_residual_diagnostics,
     impute_for_linear,
+    get_persistence_baseline_col,
 )
 
 try:
@@ -154,13 +155,16 @@ def train_ridge(horizon: int) -> dict:
     events_150 = compute_aqi_event_metrics(y_arr, preds_raw, 150)
     events_200 = compute_aqi_event_metrics(y_arr, preds_raw, 200)
 
-    lag_col = "aqi_lag_1"
+    # Use robust baseline: aqi_lag_48 / aqi_lag_72 for longer horizons,
+    # falling back to aqi_lag_1 if those were pruned by the correlation filter.
+    lag_col = get_persistence_baseline_col(X_test, horizon)
     p_mae = p_r2 = skill = r2_imp = 0.0
-    if lag_col in X_test.columns:
+    if lag_col:
         p_mae  = mean_absolute_error(y_arr, X_test[lag_col].values)
         p_r2   = r2_score(y_arr, X_test[lag_col].values)
         skill  = float(1.0 - test_mae / p_mae) if p_mae > 0 else 0.0
         r2_imp = test_r2 - p_r2
+        print(f"  Persistence baseline: {lag_col}  (MAE={p_mae:.1f}, skill={skill:.3f})")
 
     # Coefficient inspection
     coef_df = pd.DataFrame({
