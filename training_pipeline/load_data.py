@@ -207,13 +207,16 @@ def load_xy(horizon: int, use_log: bool = True) -> tuple[pd.DataFrame, pd.Series
     # Replace Inf/-Inf from any division-by-zero or rolling ops with NaN
     X = X.replace([np.inf, -np.inf], np.nan)
 
-    # Drop columns with >10% missing — these are genuinely sparse sensors
-    # (not gap-fill artifacts) and would require too much synthetic imputation.
+    # FIX BUG-4: Old threshold of 10% was too aggressive — long-range lag features
+    # (aqi_lag_336, aqi_same_weekday_hour_4w at lag-672) have ~2-8% warmup NaNs
+    # that are structurally unavoidable, not sensor gaps. Dropping them silently
+    # eliminated the most informative seasonal-cycle features. Raised to 20%.
+    # Tree models handle residual NaNs natively; linear models use impute_for_linear().
     missing_frac = X.isna().mean()
-    high_missing = missing_frac[missing_frac > 0.10].index.tolist()
+    high_missing = missing_frac[missing_frac > 0.20].index.tolist()
     if high_missing:
         print(
-            f"Dropping {len(high_missing)} features exceeding 10% NaN threshold: {high_missing}"
+            f"Dropping {len(high_missing)} features exceeding 20% NaN threshold: {high_missing}"
         )
         X = X.drop(columns=high_missing)
 

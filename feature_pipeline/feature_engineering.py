@@ -129,9 +129,13 @@ def build_features(df_raw: pd.DataFrame) -> pd.DataFrame:
     # ── STEP 1: LEAKAGE-FREE CAUSAL IMPUTATION ────────────────────────────────
     df = df.set_index("datetime")
     num_cols = df.select_dtypes(include=np.number).columns
-    df[num_cols] = df[num_cols].ffill().bfill(limit=1)
+    # FIX BUG-2: Removed bfill(limit=1) — even limit=1 pulls from one future row,
+    # violating causality. Leading NaNs at the very start of the series are
+    # handled by the warm-up row filter in Step 15 (aqi_same_hour_30days_ago
+    # will be NaN there, so those rows are dropped before training anyway).
+    df[num_cols] = df[num_cols].ffill()
     df = df.reset_index()
-    print(" -> Causal imputation complete (ffill only — no future leakage).")
+    print(" -> Causal imputation complete (ffill only — bfill removed to prevent future leakage).")
 
     # ── STEP 2: AQI COMPUTATION + MULTI-HORIZON TARGETS ──────────────────────
     df["aqi"] = df["pm25"].apply(calculate_aqi_from_pm25)
@@ -234,6 +238,11 @@ def build_features(df_raw: pd.DataFrame) -> pd.DataFrame:
         "aqi_same_hour_2weeks_ago": df["aqi"].shift(336),
         "aqi_same_hour_3days_ago":  df["aqi"].shift(72),
         "aqi_same_hour_30days_ago": df["aqi"].shift(720),
+        # FIX: Add exact same-weekday same-hour lag — more predictive than raw
+        # aqi_lag_168 for Karachi because traffic/industrial patterns repeat
+        # weekly. 168h = 7*24 = same hour same weekday last week.
+        "aqi_same_weekday_hour_2w": df["aqi"].shift(336),  # 2 identical weekday cycles
+        "aqi_same_weekday_hour_4w": df["aqi"].shift(672),  # 4 weeks (28 days)
     })
     df = pd.concat([df, pd.DataFrame(lag_cols, index=df.index)], axis=1)
 
@@ -446,6 +455,20 @@ def build_features(df_raw: pd.DataFrame) -> pd.DataFrame:
     if ws_col_14 and "pm25" in df.columns:
         met_cols["wind_dispersal"] = df[ws_col_14].shift(1) / (df["pm25"].shift(1) + 5)
 
+    # FIX BUG-1: interaction_pm25_humidity and interaction_pm25_wind_inverse were
+    # listed in the protected set in load_data.py but never built here. These are
+    # the two most physically meaningful pollutant-met interactions for PM2.5
+    # accumulation (high humidity traps particles; low wind prevents dispersal).
+    # Adding them gives tree models direct access to these joint signals.
+    if hum_col and "pm25" in df.columns:
+        met_cols["interaction_pm25_humidity"] = (
+            df["pm25"].shift(1) * df[hum_col].shift(1) / 100.0
+        )
+    if ws_col_14 and "pm25" in df.columns:
+        met_cols["interaction_pm25_wind_inverse"] = (
+            df["pm25"].shift(1) / (df[ws_col_14].shift(1) + 0.5)
+        ).clip(upper=500)
+
     dew_col = _resolve_col(df, "dew_point", "dew_point_2m")
     if temp_col and dew_col:
         met_cols["dew_point_depression"]     = df[temp_col].shift(1) - df[dew_col].shift(1)
@@ -463,10 +486,13 @@ def build_features(df_raw: pd.DataFrame) -> pd.DataFrame:
         ws_lag1_stag = df[ws_col_14].shift(1)
 
         # 24h diurnal temperature range: low range = stagnant air mass
+        # FIX BUG-3: Removed .bfill() — unbounded future-fill polluted warm-up rows
+        # with future temperature data. fillna(0) is safe: warm-up rows are dropped
+        # in Step 15 anyway, and 0 is a neutral placeholder for the filter period.
         met_cols["diurnal_temp_range_24h"] = (
             t_lag1.rolling(24, min_periods=6).max()
             - t_lag1.rolling(24, min_periods=6).min()
-        ).bfill()
+        ).fillna(0.0)
 
         # Ratio features: force the model to see the interaction directly
         met_cols["temp_to_wind_ratio"]     = t_lag1 / (ws_lag1_stag + 0.1)

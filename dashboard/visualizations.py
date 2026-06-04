@@ -28,7 +28,7 @@ _LAYOUT_BASE = dict(
 
 _MODEL_COLORS = {
     "Random Forest": "#3b82f6",
-    "Xgboost":       "#10b981",
+    "XGBoost":       "#10b981",
     "Ridge":         "#f59e0b",
 }
 

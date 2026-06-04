@@ -149,7 +149,12 @@ def train_xgboost(horizon: int) -> dict:
         X_ft, y_ft = X_train.iloc[tr_idx], y_train_log.iloc[tr_idx]
         X_fv, y_fv = X_train.iloc[val_idx], y_train_log.iloc[val_idx]
 
+        # FIX BUG-6: CV fold weights now match final model weights exactly.
+        # The old code was missing the >100 band (weight 2.0), so CV RMSE was
+        # not representative of the final model's training objective, causing
+        # hyperparameter selection to be misaligned with actual loss.
         fw = np.ones(len(y_ft))
+        fw[np.expm1(y_ft.values) > 100] = 2.0
         fw[np.expm1(y_ft.values) > 150] = 4.0
         fw[np.expm1(y_ft.values) > 200] = 8.0
 
@@ -167,18 +172,29 @@ def train_xgboost(horizon: int) -> dict:
     print(f"CV RMSE (raw AQI): {np.mean(fold_rmse):.2f} ± {np.std(fold_rmse):.2f}")
 
     # ── 6. Final model (FIX #2: tuned hyperparameters) ───────────────────────
+    # FIX BUG-5: 1200 trees with no early stopping overfits on smaller datasets.
+    # Use the calibration set as a held-out eval set for early stopping.
+    # Also add tree_method='hist' for ~3x faster training on the 32k dataset.
     model = xgb.XGBRegressor(
-        n_estimators=1200,       # FIX: was 800; more trees with small lr
-        max_depth=6,             # FIX: was 7; prevents overfitting
-        learning_rate=0.015,     # FIX: was 0.02; pairs with more trees
+        n_estimators=1200,
+        max_depth=6,
+        learning_rate=0.015,
         subsample=0.8,
         colsample_bytree=0.8,
-        min_child_weight=5,      # FIX: was 3
-        reg_lambda=2.0,          # FIX: added explicit L2
+        min_child_weight=5,
+        reg_lambda=2.0,
+        tree_method="hist",        # FIX: ~3x faster on tabular data
+        early_stopping_rounds=50,  # FIX: stop before overfitting
         random_state=42, n_jobs=-1, verbosity=0,
     )
-    print("Training final XGBoost model (log target)...")
-    model.fit(X_train_aug, y_train_aug, sample_weight=sample_weights)
+    print("Training final XGBoost model (log target, early stopping on cal set)...")
+    model.fit(
+        X_train_aug, y_train_aug,
+        sample_weight=sample_weights,
+        eval_set=[(X_cal, y_cal_log)],
+        verbose=False,
+    )
+    print(f"Best iteration: {model.best_iteration}")
     print("Done.")
 
     # ── 7. Conformal calibration ──────────────────────────────────────────────

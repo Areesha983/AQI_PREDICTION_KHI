@@ -158,15 +158,13 @@ def train_rf(horizon: int) -> dict:
 
     # ── 5. Hyperparameter optimisation ────────────────────────────────────────
     param_dist = {
-        "n_estimators":      [200, 300, 400],
-        "max_depth":         [12, 18, 25, None],
-        "min_samples_leaf":  [3, 5, 8],
-        "min_samples_split": [6, 10, 14],
-        # FIX: 'sqrt' on 150+ features tests only ~12 cols per split — too few to
-        # reliably select the new stagnation / deviation features. Fractional values
-        # give the search a much better chance of finding the right splits.
-        # 0.5 was too high (overfitting risk); 0.2–0.4 is the right band.
-        "max_features":      [0.2, 0.3, 0.4],
+        "n_estimators":      [300, 500, 700],
+        "max_depth":         [15, 20, 28, None],
+        "min_samples_leaf":  [2, 3, 5, 8],
+        "min_samples_split": [4, 6, 10, 14],
+        # FIX: Added 0.15 — on 150+ features, 'sqrt' ≈ 0.08 is too low; 0.15–0.35 is optimal.
+        # More estimators (700) compensate for the lower colsample fraction.
+        "max_features":      [0.15, 0.2, 0.3, 0.4],
     }
     base_rf   = RandomForestRegressor(random_state=42, n_jobs=-1)
     tuning_cv = TimeSeriesSplit(n_splits=3, gap=horizon)
@@ -174,14 +172,14 @@ def train_rf(horizon: int) -> dict:
     search = RandomizedSearchCV(
         estimator=base_rf,
         param_distributions=param_dist,
-        n_iter=9,
+        n_iter=15,   # FIX: was 9 — too few samples from a 4D grid; 15 gives better coverage
         cv=tuning_cv,
         scoring="neg_root_mean_squared_error",
         random_state=42,
         n_jobs=-1,
         verbose=1,
     )
-    print("Running hyperparameter search (9 fits)...")
+    print("Running hyperparameter search (15 fits)...")
     search.fit(X_train_aug, y_train_aug, sample_weight=sample_weights)
     model = search.best_estimator_
     print(f"Best params: {search.best_params_}")
