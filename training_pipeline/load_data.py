@@ -83,8 +83,50 @@ ALL_TARGETS = [
     "target_aqi_12h_deviation", "target_aqi_24h_deviation",
     "target_aqi_48h_deviation", "target_aqi_72h_deviation",
 ]
-BASE_DROP     = ["datetime", "timestamp"] + REDUNDANT_TIME_COLS + ALL_TARGETS
-LEAKAGE_EXACT = frozenset(ALL_TARGETS)
+
+# Columns that represent the CURRENT timestep's observed values.
+# These must never appear in X because at inference time (predicting the future)
+# the model would be receiving information that hasn't happened yet relative to
+# the training rows, or — worse — the exact current value that the lagged
+# features already represent causally via aqi_lag_1 / pm25_lag_1 etc.
+#
+# "aqi" is computed directly from pm25 at the same row timestamp. A model
+# predicting aqi_24h ahead that sees "aqi" is essentially seeing the answer —
+# aqi and target_aqi_24h are correlated ~0.95+, which explains near-perfect R².
+#
+# "aqi_historical_anchor" is an intermediate scratch variable used only to
+# construct the deviation targets. It should never reach the feature matrix.
+# (feature_engineering.py was fixed to stop storing it, but we guard here too.)
+#
+# Raw sensor readings (pm25, pm10, co, no2, so2, o3, dust, uv_index) are the
+# same-timestep source columns. Their lagged/rolling counterparts (pm25_lag_1,
+# pm25_roll_mean_24, etc.) are the correct causal features and are kept.
+CURRENT_TIMESTEP_COLS = [
+    "aqi",                   # derived at row-time from pm25 — use aqi_lag_* instead
+    "aqi_historical_anchor", # intermediate scratch var for deviation targets
+    "pm25",                  # raw current-hour sensor — use pm25_lag_* instead
+    "pm10",                  # raw current-hour sensor — use pm10_lag_* instead
+    "co",                    # raw current-hour sensor
+    "no2",                   # raw current-hour sensor
+    "so2",                   # raw current-hour sensor
+    "o3",                    # raw current-hour sensor
+    "dust",                  # raw current-hour sensor
+    "uv_index",              # raw current-hour sensor
+    # Weather source columns are also same-timestep; their lag/roll variants survive
+    "temperature", "temperature_2m",
+    "humidity", "relative_humidity_2m",
+    "wind_speed", "wind_speed_10m",
+    "wind_direction", "wind_direction_10m",
+    "wind_gusts",
+    "precipitation",
+    "cloud_cover",
+    "dew_point", "dew_point_2m",
+    "pressure",
+    "surface_pressure",
+]
+
+BASE_DROP     = ["datetime", "timestamp"] + REDUNDANT_TIME_COLS + ALL_TARGETS + CURRENT_TIMESTEP_COLS
+LEAKAGE_EXACT = frozenset(ALL_TARGETS + CURRENT_TIMESTEP_COLS)
 
 
 def _fetch_from_feature_store() -> pd.DataFrame:
@@ -194,7 +236,12 @@ def load_xy(horizon: int, use_log: bool = True) -> tuple[pd.DataFrame, pd.Series
     leaky = [c for c in X.columns if c in LEAKAGE_EXACT]
     if leaky:
         raise ValueError(
-            f"CRITICAL Data leakage detected. Remaining targets in features: {leaky}"
+            f"CRITICAL Data leakage detected. Forbidden columns still present in X:\n"
+            f"  {leaky}\n"
+            f"These are either future-target columns or current-timestep raw sensor/AQI "
+            f"readings that must not appear in the feature matrix. Check BASE_DROP in "
+            f"load_data.py and ensure feature_engineering.py does not store intermediate "
+            f"scratch variables (e.g. aqi_historical_anchor) as document fields."
         )
 
     # Diagnostic: report residual NaN rate per column (should be low after
@@ -213,14 +260,16 @@ def load_xy(horizon: int, use_log: bool = True) -> tuple[pd.DataFrame, pd.Series
     print(f"\nModel feature dimension space: {X.shape[1]}")
     print(f"Total row entries partitioned: {X.shape[0]:,}")
 
-    if "aqi" in X.columns:
-        aqi_target_corr = X["aqi"].corr(y_raw)
+    # Sanity-check: aqi_lag_1 should correlate well with the target but not
+    # suspiciously high (>0.99 would suggest residual leakage).
+    if "aqi_lag_1" in X.columns:
+        lag1_corr = X["aqi_lag_1"].corr(y_raw)
         flag = (
-            "  <<< WARNING: HIGH CAUSAL MULTICOLLINEARITY ASSESSED"
-            if aqi_target_corr > 0.99 else ""
+            "  <<< WARNING: SUSPICIOUSLY HIGH — CHECK FOR RESIDUAL LEAKAGE"
+            if lag1_corr > 0.99 else ""
         )
         print(
-            f"Base AQI correlation factor -> Target ({horizon}h): {aqi_target_corr:.3f}{flag}"
+            f"aqi_lag_1 correlation -> Target ({horizon}h): {lag1_corr:.3f}{flag}"
         )
 
     return X, y

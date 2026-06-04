@@ -142,25 +142,27 @@ def build_features(df_raw: pd.DataFrame) -> pd.DataFrame:
         new_cols[f"target_aqi_{h}h_log"] = np.log1p(new_cols[f"target_aqi_{h}h"])
         new_cols[f"target_cat_{h}h"]     = new_cols[f"target_aqi_{h}h"].apply(aqi_to_category)
 
-    # FEAT #3: Target deviation targets
+    # FEAT #3: Target deviation targets (TARGET COLUMNS ONLY — never used as features)
     # A 7-day (168h) rolling median anchored at the previous hour gives a causal
     # structural baseline for "what AQI typically looks like at this time of week".
-    # Predicting the deviation (future - baseline) yields a more stationary target
-    # that tree models handle better at 48h/72h horizons.
-    # ⚠️  IMPORTANT: in train_xgboost.py / train_random_forest.py / train_ridge.py,
-    # add back df["aqi_historical_anchor"] to predicted deltas before computing
-    # MAE, RMSE, and R2 against raw AQI values.
-    aqi_historical_anchor = (
+    # These deviation columns are kept as ALTERNATIVE TRAINING TARGETS alongside
+    # target_aqi_{h}h. They are listed in ALL_TARGETS in load_data.py and are
+    # explicitly dropped from X before training. Do NOT add aqi_historical_anchor
+    # to the stored feature document — it is an intermediate scratch variable only.
+    # ⚠️  NOTE: train_*.py scripts all use raw target_aqi_{h}h (not deviations),
+    # so no re-addition of anchor is needed. The deviation columns are reserved for
+    # future experimental training runs only.
+    _aqi_historical_anchor = (
         df["aqi"].shift(1)
         .rolling(168, min_periods=24)
         .median()
         .fillna(df["aqi"].median())
     )
-    new_cols["aqi_historical_anchor"] = aqi_historical_anchor
+    # Do NOT store _aqi_historical_anchor as a column — it would leak into X.
 
     for h in [12, 24, 48, 72]:
         future_aqi = df["aqi"].shift(-h)
-        new_cols[f"target_aqi_{h}h_deviation"] = future_aqi - aqi_historical_anchor
+        new_cols[f"target_aqi_{h}h_deviation"] = future_aqi - _aqi_historical_anchor
 
     df = pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
 

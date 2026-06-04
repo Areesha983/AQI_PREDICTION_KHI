@@ -31,10 +31,9 @@ jobs:
 
       - name: Execute Model Retraining Loop
         env:
-          # Injects your secured connection string to pull from 'processed_features'
           MONGODB_URI: ${{ secrets.MONGO_CONNECTION_STRING }}
         run: |
-          # Use your master wrapper script to cleanly load data and train all models
+          # Executes your training wrapper script from the workspace root
           python run_training_pipeline.py
 
       - name: Evaluate Model Performance Metrics
@@ -42,5 +41,5 @@ jobs:
           MONGODB_URI: ${{ secrets.MONGO_CONNECTION_STRING }}
         run: |
           echo "📊 Evaluating model performance metrics..."
-          # PYTHONPATH=. guarantees python resolves imports from the repo root directory
+          # PYTHONPATH=. forces the runner to resolve training_pipeline/evaluate.py from the root folder
           PYTHONPATH=. python training_pipeline/evaluate.py
