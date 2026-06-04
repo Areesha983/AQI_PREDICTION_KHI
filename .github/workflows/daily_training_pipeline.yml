@@ -32,17 +32,27 @@ jobs:
       - name: Execute Model Retraining Loop
         env:
           MONGODB_URI: ${{ secrets.MONGO_CONNECTION_STRING }}
-          # Declaring PYTHONPATH natively in the env block forces it into the runner environment flawlessly
-          PYTHONPATH: ".:training_pipeline"
         run: |
-          echo "🤖 Starting the master training pipeline wrapper..."
-          python run_training_pipeline.py
+          echo "🤖 Entering training directory and launching pipeline algorithms sequentially..."
+          # By using 'cd training_pipeline', python natively resolves 'from load_data import ...' perfectly!
+          cd training_pipeline
+          
+          echo "📥 Pulling data from Feature Store via load_data.py..."
+          python load_data.py
+          
+          echo "🤖 Training Random Forest Regressor..."
+          python train_random_forest.py
+          
+          echo "📉 Training Ridge Regressor..."
+          python train_ridge.py
+          
+          echo "⚡ Training XGBoost Regressor..."
+          python train_xgboost.py
 
       - name: Evaluate Model Performance Metrics
         env:
           MONGODB_URI: ${{ secrets.MONGO_CONNECTION_STRING }}
-          # Declaring PYTHONPATH natively here as well to fix evaluate.py imports
-          PYTHONPATH: ".:training_pipeline"
         run: |
           echo "📊 Evaluating model performance metrics..."
-          python training_pipeline/evaluate.py
+          cd training_pipeline
+          python evaluate.py
