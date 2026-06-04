@@ -65,7 +65,7 @@ except ImportError:
 
 # ── Toggle ────────────────────────────────────────────────────────────────────
 # Set to True once R² targets are met to re-enable SHAP explanations.
-COMPUTE_SHAP = False
+COMPUTE_SHAP = True
 
 # ── Path setup ────────────────────────────────────────────────────────────────
 SCRIPT_DIR = Path(__file__).resolve().parent
