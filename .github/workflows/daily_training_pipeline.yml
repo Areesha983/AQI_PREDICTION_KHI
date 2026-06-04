@@ -32,15 +32,17 @@ jobs:
       - name: Execute Model Retraining Loop
         env:
           MONGODB_URI: ${{ secrets.MONGO_CONNECTION_STRING }}
+          # Declaring PYTHONPATH natively in the env block forces it into the runner environment flawlessly
+          PYTHONPATH: ".:training_pipeline"
         run: |
           echo "🤖 Starting the master training pipeline wrapper..."
-          # PYTHONPATH=.:training_pipeline solves the inner script "ModuleNotFoundError: No module named 'load_data'"
-          PYTHONPATH=.:training_pipeline python run_training_pipeline.py
+          python run_training_pipeline.py
 
       - name: Evaluate Model Performance Metrics
         env:
           MONGODB_URI: ${{ secrets.MONGO_CONNECTION_STRING }}
+          # Declaring PYTHONPATH natively here as well to fix evaluate.py imports
+          PYTHONPATH: ".:training_pipeline"
         run: |
           echo "📊 Evaluating model performance metrics..."
-          # Running evaluate.py from inside its correct folder location
-          PYTHONPATH=.:training_pipeline python training_pipeline/evaluate.py
+          python training_pipeline/evaluate.py
