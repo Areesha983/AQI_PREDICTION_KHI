@@ -100,7 +100,7 @@ def main():
     # 5. Push Aligned Matrix straight into 'karachi_aqi_dataset' Collection via upsert
     dataset_upload = dataset.copy()
     dataset_upload["datetime"] = dataset_upload["datetime"].dt.strftime("%Y-%m-%d %H:%M:%S")
-    records = dataset_upload.to_dict(orient=\"records\")
+    records = dataset_upload.to_dict(orient="records")
 
     if records:
         output_collection = db["karachi_aqi_dataset"]
