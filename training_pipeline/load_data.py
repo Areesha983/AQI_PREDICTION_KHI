@@ -52,10 +52,13 @@ ALL_TARGETS = [
     "target_aqi_12h_deviation", "target_aqi_24h_deviation", "target_aqi_48h_deviation", "target_aqi_72h_deviation"
 ]
 CURRENT_TIMESTEP_COLS = [
-    "aqi", "aqi_historical_anchor", "pm25", "pm10", "co", "no2", "so2", "o3", 
-    "dust", "uv_index", "temperature", "temperature_2m", "humidity", 
-    "relative_humidity_2m", "wind_speed", "wind_speed_10m", "wind_direction", 
-    "wind_direction_10m", "wind_gusts", "precipitation", "cloud_cover", 
+    # These are raw current-hour sensor readings — genuine leakage if included.
+    # NOTE: aqi_historical_anchor is a 168h *lagged* rolling median — NOT leakage.
+    #       It was incorrectly placed here; it's now kept in the feature matrix.
+    "aqi", "pm25", "pm10", "co", "no2", "so2", "o3",
+    "dust", "uv_index", "temperature", "temperature_2m", "humidity",
+    "relative_humidity_2m", "wind_speed", "wind_speed_10m", "wind_direction",
+    "wind_direction_10m", "wind_gusts", "precipitation", "cloud_cover",
     "dew_point", "dew_point_2m", "pressure", "surface_pressure", "aqi_same_weekday_hour_2w"
 ]
 

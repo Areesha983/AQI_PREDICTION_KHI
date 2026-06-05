@@ -148,8 +148,8 @@ def train_rf(horizon: int) -> dict:
     # R2 v3-1: Wider grid
     param_dist = {
         "n_estimators":      [200, 300, 400, 500, 600],   # R2 v3-1
-        "max_depth":         [15, 20, 28, 35, None],       # R2 v3-1
-        "min_samples_leaf":  [3, 4, 6, 8, 12],             # R2 v3-1 (added 3)
+        "max_depth":         [20, 28, 35, None],           # FIX: dropped 15 (too shallow for 151 features)
+        "min_samples_leaf":  [2, 3, 4, 6, 8],              # FIX: added 2 for better spike capture
         "min_samples_split": [4, 6, 10, 14],
         "max_features":      ["sqrt", 0.2, 0.3, 0.4, 0.5], # R2 v3-1
     }
@@ -159,7 +159,7 @@ def train_rf(horizon: int) -> dict:
     )
     tuning_cv = TimeSeriesSplit(n_splits=3, gap=min(horizon, 24))
 
-    sw_search = _rank_weights(y_train_raw.values, cap=20.0)  # R2 v3-4
+    sw_search = _rank_weights(y_train_raw.values, cap=10.0)  # FIX: reduced cap 20→10; 20x was over-emphasizing spikes at the cost of overall R²
 
     search = RandomizedSearchCV(
         estimator=base_rf,
@@ -185,11 +185,11 @@ def train_rf(horizon: int) -> dict:
         X_train, y_train_log,
         y_train_raw=y_train_raw,
         spike_threshold=150,
-        target_spike_fraction=0.15,
+        target_spike_fraction=0.20,  # FIX: raised from 0.15 — more spike coverage
     )
 
     y_aug_raw_vals = np.expm1(y_train_aug.values)
-    sample_weights = _rank_weights(y_aug_raw_vals, cap=20.0)  # R2 v3-4
+    sample_weights = _rank_weights(y_aug_raw_vals, cap=10.0)  # FIX: matches search cap
 
     # ── 5. Final model fit ────────────────────────────────────────────────────
     final_params = {**best_params, "n_estimators": min(best_params["n_estimators"], 500)}

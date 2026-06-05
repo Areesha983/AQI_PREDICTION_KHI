@@ -113,12 +113,12 @@ def _build_best_linear_model(
     R2 v3-1: Train both Ridge and ElasticNet; return whichever has lower CV error.
     Returns (pipeline, model_type_str).
     """
+    # FIX: alpha grid extended from 1e-4..1e4 to 1e-6..1e6 — all three horizons
+    # were choosing alpha=10000 (the old max), meaning the optimum was beyond the grid.
+    alpha_grid = np.logspace(-6, 6, 60)
     ridge_pipe = Pipeline([
         ("scaler", StandardScaler()),
-        ("ridge",  RidgeCV(
-            alphas=np.logspace(-4, 4, 40),
-            cv=tscv_final,
-        )),
+        ("ridge",  RidgeCV(alphas=alpha_grid, cv=tscv_final)),
     ])
     ridge_pipe.fit(X_train, y_train)
 
@@ -126,7 +126,7 @@ def _build_best_linear_model(
         ("scaler", StandardScaler()),
         ("enet",   ElasticNetCV(
             l1_ratio=[0.1, 0.3, 0.5, 0.7, 0.9],
-            alphas=np.logspace(-4, 2, 30),
+            alphas=np.logspace(-6, 4, 40),  # FIX: extended range
             cv=tscv_final,
             max_iter=5000,
         )),
@@ -180,7 +180,7 @@ def train_ridge(horizon: int) -> dict:
         fold_pipe = Pipeline([
             ("scaler", StandardScaler()),
             ("ridge",  RidgeCV(
-                alphas=np.logspace(-4, 4, 30),
+                alphas=np.logspace(-6, 6, 50),  # FIX: extended
                 cv=TimeSeriesSplit(n_splits=3),
             )),
         ])
