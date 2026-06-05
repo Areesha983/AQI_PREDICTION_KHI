@@ -88,7 +88,9 @@ _METRIC_ALIASES = {
 def _mongo_client():
     if not MONGO_URI:
         raise ValueError("MONGODB_URI is not set in environment / .env")
-    return MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+    # socketTimeoutMS raised to 120 s to match mongo_store.py — GridFS reads
+    # large model artifacts in chunks and can exceed the old 5 s default.
+    return MongoClient(MONGO_URI, serverSelectionTimeoutMS=10_000, socketTimeoutMS=120_000)
 
 
 def _extract_metric(doc: dict, key: str) -> float:
