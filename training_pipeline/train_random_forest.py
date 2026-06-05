@@ -125,14 +125,21 @@ def quantile_error_analysis(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
 
 # R2 FIX 1: Custom scorer on raw AQI scale so hyperparameter search directly
 # minimises the metric we care about, not log-space RMSE.
-def _raw_neg_mae_scorer(estimator, X, y_log):
-    """Score on raw AQI scale (neg MAE); higher = better."""
-    pred_log = estimator.predict(X)
-    pred_raw = np.expm1(np.clip(pred_log, 0, None))
-    y_raw    = np.expm1(y_log)
-    return -mean_absolute_error(y_raw, pred_raw)
+def raw_neg_mae_score_func(y_true_log, y_pred_log):
+    """
+    Standard evaluation function signature: (y_true, y_pred).
+    Converts log-transformed targets back to the raw AQI scale before 
+    calculating the Mean Absolute Error (MAE).
+    """
+    # Invert log1p transformation to bring values back to raw AQI scale
+    y_true_raw = np.expm1(y_true_log)
+    y_pred_raw = np.expm1(np.clip(y_pred_log, 0, None))
+    
+    # Return negative MAE because scikit-learn search optimizers maximize metrics
+    return -mean_absolute_error(y_true_raw, y_pred_raw)
 
-raw_mae_scorer = make_scorer(_raw_neg_mae_scorer)
+# Correctly wrap it using make_scorer with the target function
+raw_mae_scorer = make_scorer(raw_neg_mae_score_func)
 
 
 def train_rf(horizon: int) -> dict:
