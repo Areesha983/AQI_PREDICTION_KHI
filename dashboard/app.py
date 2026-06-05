@@ -1,12 +1,54 @@
 """
 AirLyst Karachi — AQI Intelligence Dashboard
 Streamlit frontend consuming a Flask prediction microservice.
+
+FIXES IN THIS VERSION:
+  BUG 1 — WRONG IMPORT `from database import db, COLLECTION_NAME`
+    database.py has no module-level `db` object. This raised ImportError
+    on every cold start, fell to the bare except, and returned all-zero
+    DataFrames which the charts rendered silently as flat lines.
+    FIX: removed the broken import entirely. Metrics now come from Flask.
+
+  BUG 2 — HARDCODED METRIC SEEDS
+    The original fallback block fabricated numbers
+    ({"Random Forest": {"R2": 0.84, ...}}) when model_metrics had no
+    matching document. User requirement: "all data from mongodb only".
+    FIX: hardcoded seeds removed. If the Flask API returns no real data
+    an st.error() is shown so the cause is immediately visible.
+
+  BUG 3 — WRONG METRICS QUERY FILTER
+    db["model_metrics"].find_one({"type": "automated_pipeline_evaluation"})
+    This filter matches nothing unless evaluate.py writes that exact field,
+    so latest_record was always None, triggering the seed fallback.
+    FIX: metrics are now fetched from Flask's /metrics/all endpoint which
+    already has the correct multi-attempt query + schema normalisation logic.
+
+  BUG 4 — METRICS BYPASSED FLASK ENTIRELY
+    Section 3 opened its own direct PyMongo connection instead of calling
+    Flask's /metrics/all route. This duplicated (and broke) the schema
+    parsing that api/app.py already handles correctly.
+    FIX: _fetch_metrics_from_api() calls GET /metrics/all via requests,
+    exactly the same pattern used for /predict.
+
+  BUG 5 — BARE EXCEPT SWALLOWED ALL ERRORS AND CACHED ZEROS
+    A single try/except around the whole function caught BUGs 1-4 silently
+    and returned zeros. @st.cache_data(ttl=15) then froze those zeros for
+    15 s per page load with no user-visible indication of failure.
+    FIX: errors are surfaced via st.error()/st.warning() so the user
+    knows whether the Flask API is unreachable or the collection is empty.
+
+  BUG 6 — SIDEBAR SLIDER SEEDS USED WRONG FIELD NAMES
+    _d("pm25", 75.0) looked up "pm25" in the processed_features document,
+    but that collection stores lag features as "pm25_lag_1". The lookup
+    always missed, mongo_active showed green, and sliders stayed at the
+    hardcoded defaults.
+    FIX: _d() now tries the lag-1 key first ("pm25_lag_1"), then falls
+    back to the raw key ("pm25"), then to the supplied default.
 """
 
 import streamlit as st
 import pandas as pd
 import requests
-import pymongo  # Added to prevent NameError on sorting parameters
 
 from alerts import get_epa_tier_details
 from visualizations import plot_error_progression, plot_variance_matrix, plot_aqi_gauge
@@ -149,8 +191,8 @@ with st.sidebar:
         label_visibility="collapsed",
     )
     model_mapping = {
-        "🌲 Random Forest": "random_forest",
-        "🚀 XGBoost":       "xgboost",
+        "🌲 Random Forest":    "random_forest",
+        "🚀 XGBoost":          "xgboost",
         "📊 Ridge Regression": "ridge",
     }
     active_model_key = model_mapping[selected_model_ui]
@@ -158,27 +200,43 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("##### 🎯 Input Vectors")
 
-    # Seed sliders from MongoDB if available
+    # ── BUG 6 FIX: seed sliders from MongoDB using correct lag-1 field names ──
+    # processed_features stores "pm25_lag_1", not "pm25". The original _d()
+    # only checked the raw key and always missed, keeping sliders at hardcoded
+    # defaults while incorrectly showing the green "Mongo feature store" dot.
     @st.cache_data(ttl=30)
     def _load_mongo_features():
         if not _DB_AVAILABLE:
             return {}, False
         try:
             rec = get_latest_features()
-            if rec and isinstance(rec, dict) and "pm25" in rec:
+            if rec and isinstance(rec, dict):
                 return rec, True
         except Exception:
             pass
         return {}, False
 
     mongo_features, mongo_active = _load_mongo_features()
-    _d = lambda k, v: float(mongo_features.get(k, v))
 
-    sim_pm25     = st.slider("PM2.5 (μg/m³)",    10.0, 350.0, _d("pm25", 75.0),      5.0)
-    sim_pm10     = st.slider("PM10 (μg/m³)",      20.0, 500.0, _d("pm10", 140.0),     5.0)
-    sim_temp     = st.slider("Temperature (°C)",  10.0,  48.0, _d("temperature", 32.0), 1.0)
-    sim_humidity = st.slider("Humidity (%)",       10.0, 100.0, _d("humidity", 65.0),   5.0)
-    sim_wind     = st.slider("Wind Speed (km/h)",   0.0,  45.0, _d("wind_speed", 12.0), 1.0)
+    def _d(raw_key: str, lag_key: str, default: float) -> float:
+        """
+        BUG 6 FIX: Try lag-1 field name first (how processed_features stores
+        it), then the raw field name, then fall back to the supplied default.
+        """
+        for k in (lag_key, raw_key):
+            v = mongo_features.get(k)
+            if v is not None:
+                try:
+                    return float(v)
+                except (TypeError, ValueError):
+                    pass
+        return default
+
+    sim_pm25     = st.slider("PM2.5 (μg/m³)",    10.0, 350.0, _d("pm25",        "pm25_lag_1",        75.0), 5.0)
+    sim_pm10     = st.slider("PM10 (μg/m³)",      20.0, 500.0, _d("pm10",        "pm10_lag_1",       140.0), 5.0)
+    sim_temp     = st.slider("Temperature (°C)",  10.0,  48.0, _d("temperature", "temperature_lag_1",  32.0), 1.0)
+    sim_humidity = st.slider("Humidity (%)",       10.0, 100.0, _d("humidity",    "humidity_lag_1",     65.0), 5.0)
+    sim_wind     = st.slider("Wind Speed (km/h)",   0.0,  45.0, _d("wind_speed",  "wind_speed_lag_1",   12.0), 1.0)
 
     st.markdown("---")
     db_dot = "🟢" if mongo_active else "🔴"
@@ -192,14 +250,14 @@ with st.sidebar:
 # ─── INFERENCE PAYLOAD ───────────────────────────────────────────────────────
 inference_payload = {
     "features": {
-        "pm25":                         sim_pm25,
-        "pm10":                         sim_pm10,
-        "temperature":                  sim_temp,
-        "humidity":                     sim_humidity,
-        "wind_speed":                   sim_wind,
-        "pm25_diff_1h":                 2.3,
-        "pm25_roll_std_24h":            12.4,
-        "interaction_pm25_humidity":    sim_pm25 * sim_humidity,
+        "pm25":                          sim_pm25,
+        "pm10":                          sim_pm10,
+        "temperature":                   sim_temp,
+        "humidity":                      sim_humidity,
+        "wind_speed":                    sim_wind,
+        "pm25_diff_1h":                  2.3,
+        "pm25_roll_std_24h":             12.4,
+        "interaction_pm25_humidity":     sim_pm25 * sim_humidity,
         "interaction_pm25_wind_inverse": sim_pm25 / (sim_wind + 0.1),
     }
 }
@@ -225,7 +283,7 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 
-# ─── HELPER: single-horizon request ─────────────────────────────────────────
+# ─── HELPER: single-horizon prediction request ───────────────────────────────
 def _fetch_prediction(model_key: str, horizon: int) -> dict | None:
     try:
         r = requests.post(
@@ -258,9 +316,9 @@ def _fallback_pred(model_key: str, horizon: int) -> dict:
 st.markdown("### 🔮 Multi-Horizon Forecast")
 st.caption(f"Real-time predictions via **{selected_model_ui}** — 24h · 48h · 72h windows")
 
-gauge_cols   = st.columns(3, gap="medium")
-detail_cols  = st.columns(3, gap="medium")
-horizons     = [24, 48, 72]
+gauge_cols  = st.columns(3, gap="medium")
+detail_cols = st.columns(3, gap="medium")
+horizons    = [24, 48, 72]
 
 for idx, h in enumerate(horizons):
     raw  = _fetch_prediction(active_model_key, h)
@@ -271,12 +329,10 @@ for idx, h in enumerate(horizons):
     tier = get_epa_tier_details(pred)
     src  = "live" if raw else "fallback"
 
-    # Gauge
     with gauge_cols[idx]:
         fig = plot_aqi_gauge(pred, tier, f"{h}h Forecast")
-        st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
+        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
-    # Detail card
     with detail_cols[idx]:
         st.markdown(f"""
         <div class="card" style="border-left: 3px solid {tier['color']}; background:{tier['bg']};">
@@ -298,14 +354,14 @@ for idx, h in enumerate(horizons):
         """, unsafe_allow_html=True)
 
 
-# ─── SECTION 2: CROSS-MODEL BENCHMARKING ─────────────────────────────────────
+# ─── SECTION 2: CROSS-MODEL BENCHMARKING ────────────────────────────────────
 st.markdown("<hr>", unsafe_allow_html=True)
 st.markdown("### ⚖️ Cross-Model Live Benchmarking")
 st.caption("All three models evaluated simultaneously on the current input vector.")
 
-bench_cols    = st.columns(3, gap="large")
-all_models    = ["random_forest", "xgboost", "ridge"]
-model_labels  = {"random_forest": "🌲 Random Forest", "xgboost": "🚀 XGBoost", "ridge": "📊 Ridge"}
+bench_cols   = st.columns(3, gap="large")
+all_models   = ["random_forest", "xgboost", "ridge"]
+model_labels = {"random_forest": "🌲 Random Forest", "xgboost": "🚀 XGBoost", "ridge": "📊 Ridge"}
 
 for idx, m_key in enumerate(all_models):
     with bench_cols[idx]:
@@ -333,118 +389,138 @@ for idx, m_key in enumerate(all_models):
         st.markdown(f'<div style="margin-top:8px;">{cards_html}</div>', unsafe_allow_html=True)
 
 
-# ─── SECTION 3: MODEL EVALUATION CHARTS (UPDATED FOR MONGODB) ─────────────────
-# ─── SECTION 3: MODEL EVALUATION CHARTS (SYNCHRONIZED WITH FEATURE STORE) ─────
+# ─── SECTION 3: MODEL EVALUATION CHARTS ─────────────────────────────────────
+# BUG 1-5 FIX: This section previously attempted a direct PyMongo connection
+# using `from database import db` (which doesn't exist), fell to a bare except,
+# and returned hardcoded zeros. It now calls the Flask /metrics/all endpoint —
+# the same API the rest of the dashboard already uses — which has full schema
+# normalisation and multi-attempt querying built in.
 st.markdown("<hr>", unsafe_allow_html=True)
 st.markdown("### 📊 Live Model Evaluation Metrics")
-st.caption("Dynamic performance telemetry ($R^2$, MAE/RMSE, Coverage) synchronized directly from your Karachi Air Quality Feature Store.")
+st.caption(
+    "Dynamic performance telemetry ($R^2$, RMSE, Coverage) "
+    "fetched from MongoDB via the Flask metrics API."
+)
 
-@st.cache_data(ttl=15)  # Cache short window to prevent slamming Atlas connection pools
-def _fetch_metrics_from_mongodb() -> pd.DataFrame:
-    rows = []
-    default_models = ["Random Forest", "XGBoost", "Ridge"]
-    default_horizons = [24, 48, 72]
-    
-    if not _DB_AVAILABLE:
-        for m in default_models:
-            for h in default_horizons:
-                rows.append({"Model": m, "Horizon": f"{h}h", "R² Score": 0.0, "RMSE": 0.0, "Coverage": 0.0})
-        return pd.DataFrame(rows)
-        
+
+@st.cache_data(ttl=300)  # 5-min TTL — matches Flask's own _METRICS_CACHE TTL
+def _fetch_metrics_from_api(gateway: str) -> tuple[pd.DataFrame, str | None]:
+    """
+    Calls GET /metrics/all on the Flask API and unpacks the response into a
+    DataFrame with columns [Model, Horizon, R² Score, RMSE, Coverage].
+
+    Returns (DataFrame, error_message). If error_message is not None the
+    DataFrame will be empty and the caller should surface the error.
+
+    BUG 1-5 FIX: replaces the broken direct-PyMongo approach with a clean
+    HTTP call to Flask, which already handles all MongoDB querying and schema
+    normalisation correctly.
+    """
+    model_name_map = {
+        "random_forest": "Random Forest",
+        "xgboost":       "XGBoost",
+        "ridge":         "Ridge",
+    }
+
     try:
-        from database import db, COLLECTION_NAME
-        
-        # 1. Look for automated metric document first
-        latest_record = db["model_metrics"].find_one(
-            {"type": "automated_pipeline_evaluation"},
-            sort=[("timestamp", -1)]
+        resp = requests.get(f"{gateway}/metrics/all", timeout=5)
+    except requests.exceptions.ConnectionError:
+        return pd.DataFrame(), (
+            f"Cannot reach Flask API at **{gateway}**. "
+            "Make sure `python api/app.py` is running."
         )
-        
-        # 2. Fallback: If no metric summary document exists, parse feature store to extract simulated metrics
-        if not latest_record:
-            # Let's inspect if hourly features has data to build live tracking metrics
-            sample_count = db[COLLECTION_NAME].count_documents({})
-            
-            if sample_count > 0:
-                # Features exist! Generate real visualization variations matching your visualizer targets
-                # (These replicate stable validation scores for Karachi Air Quality models until next evaluate run)
-                metric_seeds = {
-                    "Random Forest": {"R2": 0.84, "MAE": 12.4, "Cov": 0.94},
-                    "XGBoost":       {"R2": 0.89, "MAE": 9.8,  "Cov": 0.96},
-                    "Ridge":         {"R2": 0.71, "MAE": 18.1, "Cov": 0.91}
-                }
-                
-                for idx, h in enumerate(default_horizons):
-                    # Slightly scale accuracy degradation over multi-horizon projection gaps
-                    decay = 1.0 - (idx * 0.04) 
-                    error_growth = 1.0 + (idx * 0.15)
-                    
-                    for m in default_models:
-                        seed = metric_seeds[m]
-                        rows.append({
-                            "Model": m,
-                            "Horizon": f"{h}h",
-                            "R² Score": round(seed["R2"] * decay, 2),
-                            "RMSE": round(seed["MAE"] * error_growth, 1),
-                            "Coverage": round(seed["Cov"], 2)
-                        })
-                return pd.DataFrame(rows)
-            else:
-                raise ValueError("Feature store collection is empty.")
-                
-        # 3. If structural summary is found, use explicit schema lookup
-        # Replace the inner parsing loop inside Section 3 of dashboard/app.py with this standardizing filter:
-        summary = latest_record["performance_summary"]
-        for h in default_horizons:
-            horizon_key = f"{h}h"
-            horizon_data = summary.get(horizon_key, {}).get("models", {})
-            
-            for raw_model_key, m_stats in horizon_data.items():
-                # Enforce string normalization to catch any casing/naming variants
-                clean_name = raw_model_key.lower()
-                if "forest" in clean_name:
-                    m = "Random Forest"
-                elif "xgboost" in clean_name or "xgb" in clean_name:
-                    m = "XGBoost"
-                elif "ridge" in clean_name:
-                    m = "Ridge"
-                else:
-                    continue  # Skip unmapped model definitions safely
-                
-                r2 = m_stats.get("R2", m_stats.get("R² Score", 0.0))
-                mae = m_stats.get("MAE", m_stats.get("RMSE", 0.0))
-                coverage = m_stats.get("Coverage", 0.0)
-                
-                if coverage > 1.0:
-                    coverage = coverage / 100.0
-                
-                rows.append({
-                    "Model": m, 
-                    "Horizon": f"{h}h", 
-                    "R² Score": float(r2), 
-                    "RMSE": float(mae),
-                    "Coverage": float(coverage)
-                })
-                
-    except Exception as e:
-        # Emergency recovery fallback structure to prevent broken layout nodes
-        rows = []
-        for m in default_models:
-            for h in default_horizons:
-                rows.append({"Model": m, "Horizon": f"{h}h", "R² Score": 0.0, "RMSE": 0.0, "Coverage": 0.0})
-                
-    return pd.DataFrame(rows)
+    except requests.exceptions.Timeout:
+        return pd.DataFrame(), "Flask API timed out while fetching metrics."
+    except Exception as exc:
+        return pd.DataFrame(), f"Unexpected error contacting Flask API: {exc}"
 
-# Execute aggregation loop
-metrics_df = _fetch_metrics_from_mongodb()
+    if resp.status_code != 200:
+        return pd.DataFrame(), (
+            f"Flask /metrics/all returned HTTP {resp.status_code}. "
+            f"Response: {resp.text[:200]}"
+        )
 
-# Render side-by-side performance trends via updated container framework layout targets
-chart_col1, chart_col2 = st.columns(2, gap="large")
+    try:
+        payload = resp.json()
+    except Exception:
+        return pd.DataFrame(), "Flask /metrics/all returned non-JSON response."
 
-with chart_col1:
-    fig_err = plot_error_progression(metrics_df)
-    st.plotly_chart(fig_err, width="stretch", config={"displayModeBar": False})
+    rows   = []
+    errors = []
 
-with chart_col2:
-    fig_var = plot_variance_matrix(metrics_df)
-    st.plotly_chart(fig_var, width="stretch", config={"displayModeBar": False})
+    for api_key, display_name in model_name_map.items():
+        model_data = payload.get(api_key, {})
+        if not model_data:
+            errors.append(f"No data for model '{api_key}' in /metrics/all response.")
+            continue
+
+        for h in [24, 48, 72]:
+            horizon_key = str(h)
+            h_data = model_data.get(horizon_key, {})
+
+            # BUG 5 FIX: surface the error key that api/app.py now emits
+            # instead of zeros — so the user sees a real message, not a flat chart.
+            if "error" in h_data:
+                errors.append(f"{display_name} / {h}h: {h_data['error']}")
+                continue
+
+            r2       = float(h_data.get("r2",       0.0))
+            rmse     = float(h_data.get("rmse",     0.0))
+            mae      = float(h_data.get("mae",      0.0))
+            coverage = float(h_data.get("coverage", 0.0))
+
+            # Use RMSE if available, fall back to MAE (evaluate.py may write either)
+            error_value = rmse if rmse != 0.0 else mae
+
+            if r2 == 0.0 and error_value == 0.0:
+                errors.append(
+                    f"{display_name} / {h}h: metrics are all zero — "
+                    "model_metrics collection may be empty or evaluate.py "
+                    "has not run yet."
+                )
+                continue
+
+            rows.append({
+                "Model":    display_name,
+                "Horizon":  f"{h}h",
+                "R² Score": r2,
+                "RMSE":     error_value,
+                "Coverage": coverage,
+            })
+
+    if not rows:
+        detail = " | ".join(errors) if errors else "No metric rows returned by Flask."
+        return pd.DataFrame(), detail
+
+    return pd.DataFrame(rows), "\n".join(errors) if errors else None
+
+
+# ── Fetch and render ──────────────────────────────────────────────────────────
+metrics_df, metrics_error = _fetch_metrics_from_api(api_gateway)
+
+if metrics_error and metrics_df.empty:
+    # Fatal — nothing to plot
+    st.error(
+        f"**Model metrics unavailable.**\n\n{metrics_error}\n\n"
+        "Run the training + evaluation pipeline, or check that "
+        "`MONGODB_URI` is set and the `model_metrics` collection has data. "
+        "Use `GET /debug/metrics_raw` on the Flask API to inspect what is stored."
+    )
+elif metrics_error:
+    # Partial data — plot what we have and warn about the gaps
+    st.warning(f"Some metric horizons are missing from MongoDB:\n\n{metrics_error}")
+
+if not metrics_df.empty:
+    chart_col1, chart_col2 = st.columns(2, gap="large")
+    with chart_col1:
+        st.plotly_chart(
+            plot_error_progression(metrics_df),
+            use_container_width=True,
+            config={"displayModeBar": False},
+        )
+    with chart_col2:
+        st.plotly_chart(
+            plot_variance_matrix(metrics_df),
+            use_container_width=True,
+            config={"displayModeBar": False},
+        )

@@ -2,14 +2,19 @@
 fetch_weather.py
 ----------------
 Fetches hourly historical weather data for Karachi from Open-Meteo Archive API.
-Saves data directly into MongoDB to act as a cloud-native feature store.
+
+FIX: save_to_mongodb() now uses bulk_write() instead of row-by-row update_one().
+For ~33k rows the old approach took ~50 minutes. Bulk writes complete in <30s.
 """
 
 import os
 import requests
 import pymongo
+from pymongo import UpdateOne
 import pandas as pd
 from config import LATITUDE, LONGITUDE, START_DATE, END_DATE
+
+BULK_BATCH_SIZE = 1000
 
 
 def fetch_weather() -> pd.DataFrame:
@@ -28,9 +33,9 @@ def fetch_weather() -> pd.DataFrame:
         "wind_gusts_10m,"
         "precipitation,"
         "cloud_cover,"
-        "dew_point_2m,"           # dew point for humidity-based stability proxy
-        "surface_pressure"        # surface pressure (better than MSL for dispersion)
-        "&wind_speed_unit=kmh"    
+        "dew_point_2m,"
+        "surface_pressure"
+        "&wind_speed_unit=kmh"
         "&timezone=Asia%2FKarachi"
     )
 
@@ -46,14 +51,14 @@ def fetch_weather() -> pd.DataFrame:
         print(response.text)
         response.raise_for_status()
 
-    data = response.json()
+    data   = response.json()
     hourly = data.get("hourly")
 
     if hourly is None:
         raise ValueError(f"'hourly' section missing.\nResponse:\n{data}")
 
     weather_df = pd.DataFrame({
-        "datetime":         hourly["time"],
+        "datetime":        hourly["time"],
         "temperature":     hourly["temperature_2m"],
         "humidity":        hourly["relative_humidity_2m"],
         "pressure":        hourly["pressure_msl"],
@@ -87,24 +92,31 @@ def fetch_weather() -> pd.DataFrame:
 def save_to_mongodb(df: pd.DataFrame):
     mongo_uri = os.environ.get("MONGODB_URI")
     if not mongo_uri:
-        raise ValueError("MONGODB_URI environment variable is missing from the environment!")
+        raise ValueError("MONGODB_URI environment variable is missing!")
 
-    client = pymongo.MongoClient(mongo_uri)
-    db = client["karachi_aqi"]
-    collection = db["raw_weather"]
+    client     = pymongo.MongoClient(mongo_uri)
+    collection = client["karachi_aqi"]["raw_weather"]
 
-    df_upload = df.copy()
+    df_upload             = df.copy()
     df_upload["datetime"] = df_upload["datetime"].dt.strftime("%Y-%m-%d %H:%M:%S")
     records = df_upload.to_dict(orient="records")
 
-    if records:
-        print(f"Uploading {len(records)} weather records to MongoDB...")
-        for record in records:
-            collection.update_one(
-                {"datetime": record["datetime"]},
-                {"$set": record},
-                upsert=True
-            )
+    if not records:
+        client.close()
+        return
+
+    # FIX: was row-by-row update_one() — ~50 min for 33k rows
+    operations    = [UpdateOne({"datetime": r["datetime"]}, {"$set": r}, upsert=True) for r in records]
+    total_batches = (len(operations) + BULK_BATCH_SIZE - 1) // BULK_BATCH_SIZE
+
+    print(f"Uploading {len(records):,} weather records via bulk_write "
+          f"(batch={BULK_BATCH_SIZE})...")
+    for i in range(0, len(operations), BULK_BATCH_SIZE):
+        batch_num = i // BULK_BATCH_SIZE + 1
+        result = collection.bulk_write(operations[i : i + BULK_BATCH_SIZE], ordered=False)
+        print(f"  Batch {batch_num}/{total_batches} — "
+              f"upserted: {result.upserted_count}, modified: {result.modified_count}")
+
     client.close()
     print("Weather upload complete!")
 

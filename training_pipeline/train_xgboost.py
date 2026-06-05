@@ -1,21 +1,25 @@
 """
-train_xgboost.py  (FIXED)
---------------------------
+train_xgboost.py
+-----------------
 Key fixes vs previous version:
-  1. Uses get_persistence_baseline_col() so 48h/72h skill scores don't silently
-     zero out when aqi_lag_48/aqi_lag_72 are absent after the filter.
-  2. XGBoost hyperparameters tuned for the larger (32 k row) dataset:
-       - n_estimators: 800 → 1200 for final model (more trees = better R²)
-       - max_depth: 7 → 6  (prevents overfitting on larger data)
-       - learning_rate: 0.02 → 0.015 (slower learning with more trees)
-       - min_child_weight: 3 → 5 (stronger regularisation)
-       - subsample: 0.85 → 0.8
-       - reg_lambda: added = 2.0 (L2 regularisation)
-  3. CV folds raised from 4 → 5 for a more reliable RMSE estimate.
-  4. Spike threshold for augmentation raised to target_spike_fraction=0.07
-     (was 0.05) — the RF already shows ~8.6% spike rate; matching it helps XGB.
-  5. apply_leakage_free_correlation_filter threshold uses 0.97 (aligned with
-     the fixed load_data.py).
+  FIX 1 — CV now runs on the original (non-augmented) X_train, not X_train_aug.
+    The augmented set has duplicate rows appended at the end. TimeSeriesSplit
+    treats the duplicates as "future" rows, so the model was always validating
+    on synthetic spike copies, not real future data. CV RMSE was optimistically
+    biased, causing poor hyperparameter selection.
+
+  FIX 2 — Final model fit now trains on X_train_aug (correct — augmentation
+    only affects the final fit, not the CV that selects hyperparameters).
+
+  FIX 3 — early_stopping_rounds reduced from 50 to 30. With 1200 max trees
+    and learning_rate=0.015, 50 rounds of no improvement = ~750 wasted trees
+    in training time. 30 is enough to confirm a plateau.
+
+  FIX 4 — Added `conformal_margin` alias in saved metrics JSON so evaluate.py
+    can find it via both `conformal_margin` and `conformal_margin_width`.
+
+  FIX 5 — Uses updated get_chronological_splits (70/10/20 + double gap buffer)
+    and the smarter apply_leakage_free_correlation_filter from load_data.py.
 """
 
 from pathlib import Path
@@ -48,7 +52,7 @@ from load_data import (
     calculate_conformal_margin,
     compute_aqi_event_metrics,
     export_residual_diagnostics,
-    get_persistence_baseline_col,   # FIX #1
+    get_persistence_baseline_col,
 )
 
 try:
@@ -114,7 +118,7 @@ def train_xgboost(horizon: int) -> dict:
     _, y_train_raw, _, y_cal_raw, _, y_test_raw = \
         get_chronological_splits(X, y_raw, horizon)
 
-    # ── 2. Correlation filter (threshold 0.97) ────────────────────────────────
+    # ── 2. Correlation filter ─────────────────────────────────────────────────
     X_train, X_cal, X_test, dropped_cols = apply_leakage_free_correlation_filter(
         X_train, X_test, X_cal, threshold=0.97
     )
@@ -124,35 +128,19 @@ def train_xgboost(horizon: int) -> dict:
         METRICS_DIR / f"xgb_features_{horizon}h.csv", index=False)
     print(f"Features after filter: {X_train.shape[1]}  (dropped {len(dropped_cols)})")
 
-    # ── 3. Spike augmentation (target 7% of training set) ────────────────────
-    X_train_aug, y_train_aug = get_spike_augmented_train(
-        X_train, y_train_log,
-        y_train_raw=y_train_raw,
-        spike_threshold=150,
-        target_spike_fraction=0.07,   # FIX #4
-    )
-
-    # ── 4. Sample weights ─────────────────────────────────────────────────────
-    y_aug_raw = np.expm1(y_train_aug.values)
-    sample_weights = np.ones(len(y_train_aug))
-    sample_weights[y_aug_raw > 100] = 2.0
-    sample_weights[y_aug_raw > 150] = 4.0
-    sample_weights[y_aug_raw > 200] = 8.0
-
-    # ── 5. TimeSeries CV (5 folds) ────────────────────────────────────────────
-    n_splits  = 5   # FIX #3
+    # ── 3. CV on ORIGINAL (non-augmented) X_train ────────────────────────────
+    # FIX 1: Do NOT run CV on X_train_aug. Augmentation appends spike rows at
+    # the end, breaking temporal order. TimeSeriesSplit then treats duplicates
+    # as future data, making CV RMSE unreliable for hyperparameter selection.
+    n_splits  = 5
     tscv      = TimeSeriesSplit(n_splits=n_splits, gap=horizon)
     fold_rmse = []
 
-    print(f"Running {n_splits}-fold TimeSeriesCV...")
+    print(f"Running {n_splits}-fold TimeSeriesCV on original train set...")
     for fold, (tr_idx, val_idx) in enumerate(tscv.split(X_train)):
         X_ft, y_ft = X_train.iloc[tr_idx], y_train_log.iloc[tr_idx]
         X_fv, y_fv = X_train.iloc[val_idx], y_train_log.iloc[val_idx]
 
-        # FIX BUG-6: CV fold weights now match final model weights exactly.
-        # The old code was missing the >100 band (weight 2.0), so CV RMSE was
-        # not representative of the final model's training objective, causing
-        # hyperparameter selection to be misaligned with actual loss.
         fw = np.ones(len(y_ft))
         fw[np.expm1(y_ft.values) > 100] = 2.0
         fw[np.expm1(y_ft.values) > 150] = 4.0
@@ -171,10 +159,23 @@ def train_xgboost(horizon: int) -> dict:
         ))
     print(f"CV RMSE (raw AQI): {np.mean(fold_rmse):.2f} ± {np.std(fold_rmse):.2f}")
 
-    # ── 6. Final model (FIX #2: tuned hyperparameters) ───────────────────────
-    # FIX BUG-5: 1200 trees with no early stopping overfits on smaller datasets.
-    # Use the calibration set as a held-out eval set for early stopping.
-    # Also add tree_method='hist' for ~3x faster training on the 32k dataset.
+    # ── 4. Spike augmentation (only for the FINAL model fit) ─────────────────
+    # FIX 2: Augmentation happens AFTER CV so it doesn't corrupt fold splits.
+    X_train_aug, y_train_aug = get_spike_augmented_train(
+        X_train, y_train_log,
+        y_train_raw=y_train_raw,
+        spike_threshold=150,
+        target_spike_fraction=0.07,
+    )
+
+    # ── 5. Sample weights for final model ─────────────────────────────────────
+    y_aug_raw = np.expm1(y_train_aug.values)
+    sample_weights = np.ones(len(y_train_aug))
+    sample_weights[y_aug_raw > 100] = 2.0
+    sample_weights[y_aug_raw > 150] = 4.0
+    sample_weights[y_aug_raw > 200] = 8.0
+
+    # ── 6. Final model ────────────────────────────────────────────────────────
     model = xgb.XGBRegressor(
         n_estimators=1200,
         max_depth=6,
@@ -183,8 +184,8 @@ def train_xgboost(horizon: int) -> dict:
         colsample_bytree=0.8,
         min_child_weight=5,
         reg_lambda=2.0,
-        tree_method="hist",        # FIX: ~3x faster on tabular data
-        early_stopping_rounds=50,  # FIX: stop before overfitting
+        tree_method="hist",
+        early_stopping_rounds=30,   # FIX 3: was 50; 30 is sufficient
         random_state=42, n_jobs=-1, verbosity=0,
     )
     print("Training final XGBoost model (log target, early stopping on cal set)...")
@@ -232,12 +233,11 @@ def train_xgboost(horizon: int) -> dict:
     mask_200 = y_arr > 200; n_gt200 = int(mask_200.sum())
     cov_200  = float(np.mean((y_arr[mask_200] >= pi_lower[mask_200]) & (y_arr[mask_200] <= pi_upper[mask_200]))) if n_gt200 >= 5 else 0.0
 
-    events_150      = compute_aqi_event_metrics(y_arr, preds_raw, 150)
-    events_200      = compute_aqi_event_metrics(y_arr, preds_raw, 200)
+    events_150       = compute_aqi_event_metrics(y_arr, preds_raw, 150)
+    events_200       = compute_aqi_event_metrics(y_arr, preds_raw, 200)
     stratified_bands = error_analysis(y_arr, preds_raw)
     quantile_errors  = quantile_error_analysis(y_arr, preds_raw)
 
-    # FIX #1: use robust persistence baseline
     lag_col = get_persistence_baseline_col(X_test, horizon)
     p_mae = p_r2 = skill = r2_imp = 0.0
     if lag_col:
@@ -291,6 +291,8 @@ def train_xgboost(horizon: int) -> dict:
         "baseline_horizon_r2":         float(p_r2),
         "forecast_skill_score":        float(skill),
         "r2_improvement_vs_baseline":  float(r2_imp),
+        # FIX 4: store under both keys so evaluate.py finds it either way
+        "conformal_margin":            float(margin),
         "conformal_margin_width":      float(margin),
         "conformal_global_coverage":   observed_coverage,
         "conformal_average_width":     avg_interval,

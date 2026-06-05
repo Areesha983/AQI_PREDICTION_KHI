@@ -66,11 +66,18 @@ def run_evaluation_suite():
             mape = raw_metrics.get("test_mape")
             coverage = raw_metrics.get("conformal_global_coverage")
             
+            # FIX: Extract the missing fields that app.py expects
+            rmse = raw_metrics.get("test_rmse") or raw_metrics.get("rmse")
+            margin = raw_metrics.get("conformal_margin") or raw_metrics.get("margin")
+            
             compiled_horizons[horizon_key]["models"][model_name] = {
                 "MAE": float(mae) if mae is not None else None,
                 "R2": float(r2) if r2 is not None else None,
                 "MAPE": float(mape) if mape is not None else None,
-                "Coverage": float(coverage) if coverage is not None else None
+                "Coverage": float(coverage) if coverage is not None else None,
+                # Include these so app.py doesn't return 0.0 values
+                "RMSE": float(rmse) if rmse is not None else None,
+                "Margin": float(margin) if margin is not None else None
             }
             
             # Dynamically identify the winning model based on MAE optimization

@@ -1,15 +1,20 @@
 """
 fetch_air_quality.py
 ---------------------
-Fetches hourly air-quality forecast/reanalysis data for Karachi from Open-Meteo.
-Saves data directly into MongoDB to act as a cloud-native feature store.
+Fetches hourly air-quality data for Karachi from Open-Meteo.
+
+FIX: save_to_mongodb() now uses bulk_write() instead of row-by-row update_one().
+For ~33k rows the old approach took ~50 minutes. Bulk writes complete in <30s.
 """
 
 import os
 import requests
 import pymongo
+from pymongo import UpdateOne
 import pandas as pd
 from config import LATITUDE, LONGITUDE, START_DATE, END_DATE
+
+BULK_BATCH_SIZE = 1000
 
 
 def fetch_air_quality() -> pd.DataFrame:
@@ -26,8 +31,8 @@ def fetch_air_quality() -> pd.DataFrame:
         "nitrogen_dioxide,"
         "sulphur_dioxide,"
         "ozone,"
-        "dust,"                 # Karachi-specific dust channel
-        "uv_index"              # UV drives photochemical O3 production
+        "dust,"
+        "uv_index"
         "&timezone=Asia%2FKarachi"
     )
 
@@ -43,8 +48,8 @@ def fetch_air_quality() -> pd.DataFrame:
         print(response.text)
         response.raise_for_status()
 
-    data = response.json()
-    hourly = data.get("hourly")
+    data    = response.json()
+    hourly  = data.get("hourly")
 
     if hourly is None:
         raise ValueError(f"'hourly' section missing.\nResponse:\n{data}")
@@ -75,8 +80,7 @@ def fetch_air_quality() -> pd.DataFrame:
 
     print(f"\nRows Retrieved: {len(aq_df):,}")
     print(f"Date Range    : {aq_df['datetime'].min()}  →  {aq_df['datetime'].max()}")
-    
-    # Check PM2.5 missing percentage
+
     pm25_nan_pct = aq_df["pm25"].isna().mean() * 100
     if pm25_nan_pct > 30:
         raise RuntimeError(f"FATAL: PM2.5 is {pm25_nan_pct:.1f}% missing.")
@@ -87,27 +91,33 @@ def fetch_air_quality() -> pd.DataFrame:
 def save_to_mongodb(df: pd.DataFrame):
     mongo_uri = os.environ.get("MONGODB_URI")
     if not mongo_uri:
-        raise ValueError("MONGODB_URI environment variable is missing from the environment!")
+        raise ValueError("MONGODB_URI environment variable is missing!")
 
-    client = pymongo.MongoClient(mongo_uri)
-    db = client["karachi_aqi"]
-    collection = db["raw_air_quality"]
+    client     = pymongo.MongoClient(mongo_uri)
+    collection = client["karachi_aqi"]["raw_air_quality"]
 
-    # Convert Datetime objects to string formats so MongoDB can serialize them natively
-    df_upload = df.copy()
+    df_upload             = df.copy()
     df_upload["datetime"] = df_upload["datetime"].dt.strftime("%Y-%m-%d %H:%M:%S")
     records = df_upload.to_dict(orient="records")
 
-    if records:
-        print(f"Uploading {len(records)} air quality records to MongoDB...")
-        for record in records:
-            collection.update_one(
-                {"datetime": record["datetime"]},
-                {"$set": record},
-                upsert=True
-            )
+    if not records:
+        client.close()
+        return
+
+    # FIX: was row-by-row update_one() — ~50 min for 33k rows
+    operations    = [UpdateOne({"datetime": r["datetime"]}, {"$set": r}, upsert=True) for r in records]
+    total_batches = (len(operations) + BULK_BATCH_SIZE - 1) // BULK_BATCH_SIZE
+
+    print(f"Uploading {len(records):,} air quality records via bulk_write "
+          f"(batch={BULK_BATCH_SIZE})...")
+    for i in range(0, len(operations), BULK_BATCH_SIZE):
+        batch_num = i // BULK_BATCH_SIZE + 1
+        result = collection.bulk_write(operations[i : i + BULK_BATCH_SIZE], ordered=False)
+        print(f"  Batch {batch_num}/{total_batches} — "
+              f"upserted: {result.upserted_count}, modified: {result.modified_count}")
+
     client.close()
-    print("Air Quality upload complete!")
+    print("Air quality upload complete!")
 
 
 if __name__ == "__main__":

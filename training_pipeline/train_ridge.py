@@ -1,17 +1,16 @@
 """
 train_ridge.py
 --------------
-Production-locked Ridge Regression baseline for AQI forecasting.
+Key fixes vs previous version:
+  FIX 1 — Added `conformal_margin` alias in saved metrics JSON.
+    evaluate.py calls raw_metrics.get("conformal_margin") but the old key was
+    only `conformal_margin_width`. Dashboard was showing None for every margin.
 
-Key fixes vs original:
-  1. Trains on log1p(AQI), inverse-transforms predictions before metrics.
-  2. Conformal margins computed on the raw-AQI scale.
-  3. nan% Coverage >200 fixed — was NaN because no predictions crossed the
-     raw threshold after the old straight-line prediction on a skewed target.
-  4. Linear-model imputation added after chronological split — load_xy() now
-     returns NaNs intact for tree models. Ridge/StandardScaler cannot handle
-     NaN natively, so impute_for_linear() is called here, fitted on X_train
-     only and applied to X_cal/X_test to prevent any leakage.
+  FIX 2 — Uses updated get_chronological_splits (70/10/20 + double gap buffer)
+    and the smarter apply_leakage_free_correlation_filter from load_data.py.
+
+  No other changes to Ridge logic — log target + linear imputation + RidgeCV
+  are all correct as-is.
 """
 
 from pathlib import Path
@@ -82,10 +81,6 @@ def train_ridge(horizon: int) -> dict:
     print(f"Features after filter: {X_train.shape[1]}  (dropped {len(dropped_cols)})")
 
     # ── 2b. Linear-model imputation (train-mean, no leakage) ─────────────────
-    # load_xy() now returns NaNs intact so tree models can route them natively.
-    # Ridge and StandardScaler cannot handle NaN, so we impute here AFTER the
-    # chronological split — means are fitted on X_train only, then applied to
-    # X_cal and X_test. Doing this before the split would leak test statistics.
     X_train, X_cal, X_test = impute_for_linear(X_train, X_cal, X_test)
     print("Linear imputation applied (train-mean, fitted on X_train only).")
 
@@ -117,7 +112,7 @@ def train_ridge(horizon: int) -> dict:
     best_alpha = float(model.named_steps["ridge"].alpha_)
     print(f"Optimal alpha: {best_alpha:.4f}")
 
-    # ── 5. Conformal calibration (raw scale) ──────────────────────────────────
+    # ── 5. Conformal calibration ──────────────────────────────────────────────
     cal_pred_raw = np.expm1(np.clip(model.predict(X_cal), 0, None))
     margin       = calculate_conformal_margin(np.abs(y_cal_raw.values - cal_pred_raw))
 
@@ -155,8 +150,6 @@ def train_ridge(horizon: int) -> dict:
     events_150 = compute_aqi_event_metrics(y_arr, preds_raw, 150)
     events_200 = compute_aqi_event_metrics(y_arr, preds_raw, 200)
 
-    # Use robust baseline: aqi_lag_48 / aqi_lag_72 for longer horizons,
-    # falling back to aqi_lag_1 if those were pruned by the correlation filter.
     lag_col = get_persistence_baseline_col(X_test, horizon)
     p_mae = p_r2 = skill = r2_imp = 0.0
     if lag_col:
@@ -166,7 +159,6 @@ def train_ridge(horizon: int) -> dict:
         r2_imp = test_r2 - p_r2
         print(f"  Persistence baseline: {lag_col}  (MAE={p_mae:.1f}, skill={skill:.3f})")
 
-    # Coefficient inspection
     coef_df = pd.DataFrame({
         "feature":   X_train.columns,
         "abs_coef":  np.abs(model.named_steps["ridge"].coef_),
@@ -202,6 +194,8 @@ def train_ridge(horizon: int) -> dict:
         "baseline_horizon_r2":         float(p_r2),
         "forecast_skill_score":        float(skill),
         "r2_improvement_vs_baseline":  float(r2_imp),
+        # FIX 1: store under both keys so evaluate.py finds it
+        "conformal_margin":            float(margin),
         "conformal_margin_width":      float(margin),
         "conformal_global_coverage":   observed_coverage,
         "conformal_average_width":     avg_interval,
