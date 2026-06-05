@@ -11,3 +11,5 @@ seaborn==0.13.2
 requests==2.31.0
 python-dotenv==1.0.1
 xgboost==2.0.3
+gunicorn==21.2.0
+certifi==2024.2.2
