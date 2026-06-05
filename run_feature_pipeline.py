@@ -1,22 +1,35 @@
+"""
+run_feature_pipeline.py
+------------------------
+The master execution controller. Launches data synchronization and
+high-dimensional engineering sequences sequentially.
+"""
 import os
 import sys
 
-# Ensure current folder and subfolders are properly tracked in python module search path
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+# Get the absolute path of the directory where this script is running
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# Get the absolute path of the feature_pipeline folder
+FEATURE_PIPE_DIR = os.path.join(BASE_DIR, "feature_pipeline")
 
-from feature_pipeline import build_dataset, feature_engineering
+# Tell Python to look inside the feature_pipeline folder for imports
+if FEATURE_PIPE_DIR not in sys.path:
+    sys.path.append(FEATURE_PIPE_DIR)
+
+# Now safely import the modules directly
+import build_dataset
+import feature_engineering
 
 def run():
-    print("Starting data fetch and feature generation...")
+    print("Starting optimized incremental fetch and feature engineering sequence...")
     
-    # 1. Fetch, merge raw data, and save to 'karachi_aqi_dataset'
-    # FIX: Changed from .run() to .main() to match build_dataset.py
+    # 1. Runs build_dataset (which triggers dynamic weather & AQI catches, merges them, and saves)
     build_dataset.main() 
     
-    # 2. Run high-dimensional transformations and update 'processed_features'
+    # 2. Runs the fast vectorized high-dimensional feature pipeline
     feature_engineering.process_all()
     
-    print("Feature pipeline complete.")
+    print("Feature pipeline finalized successfully.")
 
 if __name__ == "__main__":
     run()
