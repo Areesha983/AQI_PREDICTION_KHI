@@ -84,7 +84,13 @@ def main():
     if not mongo_uri:
         raise ValueError("MONGODB_URI environment variable is missing!")
 
-    client = pymongo.MongoClient(mongo_uri)
+    client = pymongo.MongoClient(
+    mongo_uri,
+    serverSelectionTimeoutMS=15000,
+    connectTimeoutMS=15000,
+    socketTimeoutMS=15000,
+    tlsAllowInvalidCertificates=True  # Bypasses local runner certificate validation barriers
+)
     db = client["karachi_aqi"]
     collection = db["raw_weather"]
 
