@@ -1,29 +1,51 @@
 """
 fetch_air_quality.py
 ---------------------
-Fetches hourly air-quality data for Karachi from Open-Meteo.
-
-FIX: save_to_mongodb() now uses bulk_write() instead of row-by-row update_one().
-For ~33k rows the old approach took ~50 minutes. Bulk writes complete in <30s.
+Fetches air-quality data for Karachi from Open-Meteo.
+OPTIMIZATION: Dynamically determines if it needs a full historical backfill
+or an incremental hourly/daily catch-up based on existing database state.
 """
 
 import os
 import requests
 import pymongo
 from pymongo import UpdateOne
+from datetime import datetime, timedelta
 import pandas as pd
-from config import LATITUDE, LONGITUDE, START_DATE, END_DATE
+from config import LATITUDE, LONGITUDE, HISTORICAL_START_DATE, get_end_date
 
 BULK_BATCH_SIZE = 1000
 
+def get_dynamic_start_date(collection) -> str:
+    """Checks MongoDB for the latest entry to determine incremental pipeline window."""
+    try:
+        # Find the document with the maximum/latest datetime string
+        latest_record = collection.find_one(
+            filter={},
+            projection={"datetime": 1, "_id": 0},
+            sort=[("datetime", pymongo.DESCENDING)]
+        )
+        
+        if latest_record and "datetime" in latest_record:
+            latest_dt = datetime.strptime(latest_record["datetime"], "%Y-%m-%d %H:%M:%S")
+            # Step back 2 days as an operational safety buffer zone to recapture any missing/delayed hours
+            buffer_dt = latest_dt - timedelta(days=2)
+            print(f" -> Found existing records up to {latest_record['datetime']}. Setting buffer lookback.")
+            return buffer_dt.strftime("%Y-%m-%d")
+            
+    except Exception as e:
+        print(f" -> Warning while querying collection state: {e}. Falling back to historical initialization.")
+        
+    print(" -> Collection is empty. Initiating complete historical baseline pull.")
+    return HISTORICAL_START_DATE
 
-def fetch_air_quality() -> pd.DataFrame:
+def fetch_air_quality(start_date: str, end_date: str) -> pd.DataFrame:
     url = (
         "https://air-quality-api.open-meteo.com/v1/air-quality"
         f"?latitude={LATITUDE}"
         f"&longitude={LONGITUDE}"
-        f"&start_date={START_DATE}"
-        f"&end_date={END_DATE}"
+        f"&start_date={start_date}"
+        f"&end_date={end_date}"
         "&hourly="
         "pm2_5,"
         "pm10,"
@@ -37,66 +59,63 @@ def fetch_air_quality() -> pd.DataFrame:
     )
 
     print("\n" + "=" * 80)
-    print("AIR QUALITY REQUEST URL")
+    print(f"AIR QUALITY REQUEST: {start_date} to {end_date}")
     print("=" * 80)
-    print(url)
 
-    response = requests.get(url, timeout=90)
-    print(f"\nStatus Code: {response.status_code}")
-
+    response = requests.get(url, timeout=15)
     if response.status_code != 200:
-        print(response.text)
-        response.raise_for_status()
+        raise RuntimeError(f"Open-Meteo API returned error code {response.status_code}: {response.text}")
 
-    data    = response.json()
-    hourly  = data.get("hourly")
+    data = response.json()
+    if "hourly" not in data:
+        raise KeyError(f"Unexpected API response payload: {data}")
 
-    if hourly is None:
-        raise ValueError(f"'hourly' section missing.\nResponse:\n{data}")
+    hourly_data = data["hourly"]
+    aq_df = pd.DataFrame(hourly_data)
+    aq_df["datetime"] = pd.to_datetime(aq_df["time"])
+    aq_df = aq_df.drop(columns=["time"])
 
-    aq_df = pd.DataFrame({
-        "datetime": hourly["time"],
-        "pm25":     hourly["pm2_5"],
-        "pm10":     hourly["pm10"],
-        "co":       hourly["carbon_monoxide"],
-        "no2":      hourly["nitrogen_dioxide"],
-        "so2":      hourly["sulphur_dioxide"],
-        "o3":       hourly["ozone"],
-        "dust":     hourly.get("dust",     [None] * len(hourly["time"])),
-        "uv_index": hourly.get("uv_index", [None] * len(hourly["time"])),
-    })
+    # Core renaming transformations
+    rename_map = {
+        "pm2_5": "pm25",
+        "carbon_monoxide": "co",
+        "nitrogen_dioxide": "no2",
+        "sulphur_dioxide": "so2",
+    }
+    aq_df = aq_df.rename(columns=rename_map)
 
-    aq_df["datetime"] = pd.to_datetime(aq_df["datetime"])
+    # Data validation pass
+    total_rows = len(aq_df)
+    pm25_nans = aq_df["pm25"].isna().sum()
+    pm25_nan_pct = (pm25_nans / total_rows) * 100
+    print(f"Retrieved {total_rows:,} intervals. PM2.5 Missingness: {pm25_nan_pct:.2f}%")
 
-    if aq_df["datetime"].dt.tz is not None:
-        aq_df["datetime"] = aq_df["datetime"].dt.tz_localize(None)
-
-    aq_df = (
-        aq_df
-        .drop_duplicates(subset="datetime")
-        .sort_values("datetime")
-        .reset_index(drop=True)
-    )
-
-    print(f"\nRows Retrieved: {len(aq_df):,}")
-    print(f"Date Range    : {aq_df['datetime'].min()}  →  {aq_df['datetime'].max()}")
-
-    pm25_nan_pct = aq_df["pm25"].isna().mean() * 100
-    if pm25_nan_pct > 30:
+    if pm25_nan_pct > 30.0:
         raise RuntimeError(f"FATAL: PM2.5 is {pm25_nan_pct:.1f}% missing.")
 
     return aq_df
 
-
-def save_to_mongodb(df: pd.DataFrame):
+def main():
     mongo_uri = os.environ.get("MONGODB_URI")
     if not mongo_uri:
         raise ValueError("MONGODB_URI environment variable is missing!")
 
-    client     = pymongo.MongoClient(mongo_uri)
-    collection = client["karachi_aqi"]["raw_air_quality"]
+    client = pymongo.MongoClient(mongo_uri)
+    db = client["karachi_aqi"]
+    collection = db["raw_air_quality"]
 
-    df_upload             = df.copy()
+    # Calculate dates dynamically based on current collection data state
+    start_date = get_dynamic_start_date(collection)
+    end_date = get_end_date()
+    
+    if datetime.strptime(start_date, "%Y-%m-%d") > datetime.strptime(end_date, "%Y-%m-%d"):
+        print(" -> Data is already fully synchronized up to the current operational window. Skipping pull.")
+        client.close()
+        return
+
+    df = fetch_air_quality(start_date, end_date)
+    
+    df_upload = df.copy()
     df_upload["datetime"] = df_upload["datetime"].dt.strftime("%Y-%m-%d %H:%M:%S")
     records = df_upload.to_dict(orient="records")
 
@@ -104,22 +123,17 @@ def save_to_mongodb(df: pd.DataFrame):
         client.close()
         return
 
-    # FIX: was row-by-row update_one() — ~50 min for 33k rows
-    operations    = [UpdateOne({"datetime": r["datetime"]}, {"$set": r}, upsert=True) for r in records]
+    # Bulk upsert logic using standard compound keys
+    operations = [UpdateOne({"datetime": r["datetime"]}, {"$set": r}, upsert=True) for r in records]
     total_batches = (len(operations) + BULK_BATCH_SIZE - 1) // BULK_BATCH_SIZE
 
-    print(f"Uploading {len(records):,} air quality records via bulk_write "
-          f"(batch={BULK_BATCH_SIZE})...")
+    print(f"Uploading {len(records):,} air quality records via bulk_write...")
     for i in range(0, len(operations), BULK_BATCH_SIZE):
         batch_num = i // BULK_BATCH_SIZE + 1
-        result = collection.bulk_write(operations[i : i + BULK_BATCH_SIZE], ordered=False)
-        print(f"  Batch {batch_num}/{total_batches} — "
-              f"upserted: {result.upserted_count}, modified: {result.modified_count}")
-
+        collection.bulk_write(operations[i : i + BULK_BATCH_SIZE], ordered=False)
+        
     client.close()
-    print("Air quality upload complete!")
-
+    print("Air quality update cycle finalized cleanly.")
 
 if __name__ == "__main__":
-    aq_df = fetch_air_quality()
-    save_to_mongodb(aq_df)
+    main()

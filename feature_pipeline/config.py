@@ -3,7 +3,9 @@ from datetime import datetime, timedelta
 LATITUDE  = 24.8607
 LONGITUDE = 67.0011
 
-# Use yesterday as the END to avoid incomplete trailing hours
-END_DATE   = (datetime.today() - timedelta(days=1)).strftime("%Y-%m-%d")
-# Go back to Aug 2022 for a ~3-year training window
-START_DATE = "2022-08-04"
+# Historical baseline anchor (used for the very first initialization)
+HISTORICAL_START_DATE = "2022-08-04"
+
+def get_end_date() -> str:
+    """Returns yesterday's date to avoid incomplete trailing hours from API."""
+    return (datetime.today() - timedelta(days=1)).strftime("%Y-%m-%d")
