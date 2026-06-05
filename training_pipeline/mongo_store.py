@@ -24,12 +24,10 @@ from __future__ import annotations
 import io
 import os
 import pickle
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import numpy as np
-import pandas as pd
 from pymongo import MongoClient
-from pymongo.errors import PyMongoError
 import gridfs
 
 # ── Connection singleton ──────────────────────────────────────────────────────
@@ -70,14 +68,32 @@ def _run_id() -> str:
 
 def _gridfs_upsert(filename: str, data: bytes, metadata: dict) -> str:
     """
-    Store binary data in GridFS under `filename`.  If a file with the same
-    filename already exists it is deleted first so we always have one current
-    version per (model, horizon).  Returns the new file _id as a string.
+    Store binary data in GridFS under `filename`.
+
+    Retention policy: keep only the latest 2 versions per (model, horizon_h)
+    to prevent Atlas Free Tier storage from growing unboundedly across daily
+    retraining runs.  Older files are deleted before the new one is written.
+    Returns the new file _id as a string.
     """
     fs = _get_fs()
-    # Remove any existing version
-    for existing in fs.find({"filename": filename}):
-        fs.delete(existing._id)
+
+    query = {
+        "metadata.model":     metadata.get("model"),
+        "metadata.horizon_h": metadata.get("horizon_h"),
+    }
+
+    existing_files = list(fs.find(query).sort("uploadDate", -1))
+
+    KEEP_N = 2
+
+    if len(existing_files) >= KEEP_N:
+        for old_file in existing_files[KEEP_N - 1:]:
+            try:
+                print(f"  [mongo_store] 🗑  Pruning stale artifact: {old_file._id}")
+                fs.delete(old_file._id)
+            except Exception as e:
+                print(f"  [mongo_store] ⚠️  Failed to delete artifact {old_file._id}: {e}")
+
     file_id = fs.put(data, filename=filename, metadata=metadata)
     return str(file_id)
 
@@ -115,7 +131,11 @@ def save_predictions(
     pi_upper: np.ndarray,
     run_id: str | None = None,
 ) -> None:
-    """Store prediction arrays as a list of compact records."""
+    """Store prediction arrays as a list of compact records.
+
+    Retention: documents older than 30 days for the same (model, horizon)
+    are pruned to prevent unbounded collection growth across daily retraining.
+    """
     rid = run_id or _run_id()
     records = [
         {
@@ -137,6 +157,16 @@ def save_predictions(
     _upsert("model_predictions", {"model": model, "horizon_h": horizon}, doc)
     print(f"  [mongo_store] ✅ Predictions saved → model_predictions ({model} {horizon}h, n={len(records)})")
 
+    # 30-day retention — remove stale prediction docs for this (model, horizon)
+    db = get_db()
+    db["model_predictions"].delete_many(
+        {
+            "model":      model,
+            "horizon_h":  horizon,
+            "updated_at": {"$lt": datetime.now(timezone.utc) - timedelta(days=30)},
+        }
+    )
+
 
 def save_residuals(
     model: str,
@@ -145,6 +175,11 @@ def save_residuals(
     y_pred: np.ndarray,
     run_id: str | None = None,
 ) -> None:
+    """Store residual diagnostics arrays.
+
+    Retention: documents older than 30 days for the same (model, horizon)
+    are pruned to prevent unbounded collection growth across daily retraining.
+    """
     residuals = y_actual - y_pred
     records = [
         {
@@ -164,6 +199,16 @@ def save_residuals(
     }
     _upsert("model_residuals", {"model": model, "horizon_h": horizon}, doc)
     print(f"  [mongo_store] ✅ Residuals saved → model_residuals ({model} {horizon}h)")
+
+    # 30-day retention — remove stale residual docs for this (model, horizon)
+    db = get_db()
+    db["model_residuals"].delete_many(
+        {
+            "model":      model,
+            "horizon_h":  horizon,
+            "updated_at": {"$lt": datetime.now(timezone.utc) - timedelta(days=30)},
+        }
+    )
 
 
 def save_feature_list(
@@ -220,7 +265,7 @@ def save_shap_plot_png(model: str, horizon: int, fig, run_id: str | None = None)
     png_bytes = buf.read()
 
     rid      = run_id or _run_id()
-    filename = f"shap_plot_{model}_{model}_{horizon}h.png"
+    filename = f"shap_plot_{model}_{horizon}h.png"   # Fix: was f"shap_plot_{model}_{model}_{horizon}h.png"
     metadata = {
         "model":      model,
         "horizon_h":  horizon,
@@ -234,12 +279,12 @@ def save_shap_plot_png(model: str, horizon: int, fig, run_id: str | None = None)
         "model_shap_plots",
         {"model": model, "horizon_h": horizon},
         {
-            "model":      model,
-            "horizon_h":  horizon,
-            "run_id":     rid,
-            "updated_at": datetime.now(tz=timezone.utc),
-            "gridfs_filename": filename,
-            "gridfs_id":       file_id,
+            "model":             model,
+            "horizon_h":         horizon,
+            "run_id":            rid,
+            "updated_at":        datetime.now(tz=timezone.utc),
+            "gridfs_filename":   filename,
+            "gridfs_id":         file_id,
         },
     )
     print(f"  [mongo_store] ✅ SHAP plot saved → GridFS ({model} {horizon}h, {len(png_bytes)//1024}KB)")
