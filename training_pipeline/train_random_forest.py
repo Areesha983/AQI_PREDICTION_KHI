@@ -1,47 +1,30 @@
 """
-train_random_forest.py  (OPTIMISED)
+train_random_forest.py  (MONGODB-ONLY + R² IMPROVEMENTS)
 -----------------------
-Speed fixes:
-  PERF 1 — MongoDB data comes from the in-process cache (load_data.py).
-    Zero extra network I/O when all three models share the same Python process.
+Storage changes (v3):
+  STORE 1 — All file writes (csv, json, pkl, png) replaced with mongo_store calls.
+            Nothing is written to the local filesystem.
 
-  PERF 2 — RandomizedSearchCV: n_iter reduced 15→8, n_splits 3→3 (unchanged),
-    n_estimators grid capped at 400.  The old grid ran up to 700 trees × 3 folds
-    × 15 candidates = 31,500 tree builds just for search.  New: 400 × 3 × 8 =
-    9,600.  Best params barely change because RF is not very sensitive to these
-    hypers — CV noise dominates.
+R² improvements (v3):
+  R2 v3-1 — Wider hyperparameter grid: max_depth up to 35, max_features includes
+             0.4, min_samples_leaf down to 3, n_estimators up to 600.
+  R2 v3-2 — n_iter raised 8→12 for RandomizedSearchCV to explore more combinations.
+  R2 v3-3 — max_samples increased to 0.90 (was 0.85) to use more training data per
+             tree while keeping inter-tree diversity.
+  R2 v3-4 — Huber-like sample weighting replaced with rank-based weights to reduce
+             sensitivity to exact AQI values of spike rows.
 
-  PERF 3 — Final model: n_estimators fixed at 500 (was up to 700 from search).
-    500 trees at n_jobs=-1 on a 4-core runner takes ~45s vs ~90s for 700.
-
-  PERF 4 — SHAP sample size reduced 150→100 for RF.  RF SHAP is O(n_trees × n_samples)
-    and 150 samples on a 500-tree forest is ~4× slower than XGBoost SHAP.
-
-  PERF 5 — get_chronological_splits called ONCE; raw series derived from y_log
-    via expm1 instead of a second full split call.
-
-R² fixes:
-  R2 FIX 1 — Scoring changed from neg_root_mean_squared_error (log scale) to a
-    custom neg_MAE on raw AQI scale.  Optimising log-RMSE during search was
-    picking hypers that minimise log-space error, not actual AQI error.
-
-  R2 FIX 2 — min_samples_leaf minimum raised from 2→4.  Leaf=2 causes
-    overfitting on noisy AQI data; 4–6 generalises better.
-
-  R2 FIX 3 — max_samples=0.85 added to RandomForestRegressor.  Subsampling
-    rows (bootstrap fraction) adds diversity between trees which reduces
-    variance and improves test R².
-
-  R2 FIX 4 — Sample weights: exponential growth capped at 20× (was 25×).
-    Extreme weights (25×) cause high-AQI rows to dominate and hurt low/mid R².
+Previously retained fixes:
+  R2 FIX 1 — Scoring: neg_MAE on raw AQI scale (not log-RMSE).
+  R2 FIX 2 — min_samples_leaf minimum 4 to prevent leaf overfitting.
+  R2 FIX 3 — max_samples subsampling for inter-tree diversity.
+  R2 FIX 4 — Sample weight cap at 20×.
 """
 
-from pathlib import Path
 import json
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 
-import joblib
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -66,8 +49,17 @@ from load_data import (
     apply_leakage_free_correlation_filter,
     calculate_conformal_margin,
     compute_aqi_event_metrics,
-    export_residual_diagnostics,
     get_persistence_baseline_col,
+)
+from mongo_store import (
+    save_metrics,
+    save_predictions,
+    save_residuals,
+    save_feature_list,
+    save_shap,
+    save_shap_plot_png,
+    save_model_artifact,
+    _run_id,
 )
 
 try:
@@ -77,14 +69,6 @@ except ImportError:
         print("  [monitoring] module not found — skipping drift check.")
 
 COMPUTE_SHAP = True
-
-SCRIPT_DIR = Path(__file__).resolve().parent
-BASE_DIR   = SCRIPT_DIR.parent
-
-MODEL_DIR   = BASE_DIR / "models"
-METRICS_DIR = BASE_DIR / "metrics"
-MODEL_DIR.mkdir(parents=True, exist_ok=True)
-METRICS_DIR.mkdir(parents=True, exist_ok=True)
 
 print("INITIALIZING RANDOM FOREST ENGINE")
 
@@ -123,75 +107,66 @@ def quantile_error_analysis(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
     return errors
 
 
-# R2 FIX 1: Custom scorer on raw AQI scale so hyperparameter search directly
-# minimises the metric we care about, not log-space RMSE.
 def raw_neg_mae_score_func(y_true_log, y_pred_log):
-    """
-    Standard evaluation function signature: (y_true, y_pred).
-    Converts log-transformed targets back to the raw AQI scale before 
-    calculating the Mean Absolute Error (MAE).
-    """
-    # Invert log1p transformation to bring values back to raw AQI scale
     y_true_raw = np.expm1(y_true_log)
     y_pred_raw = np.expm1(np.clip(y_pred_log, 0, None))
-    
-    # Return negative MAE because scikit-learn search optimizers maximize metrics
     return -mean_absolute_error(y_true_raw, y_pred_raw)
 
-# Correctly wrap it using make_scorer with the target function
 raw_mae_scorer = make_scorer(raw_neg_mae_score_func)
+
+
+def _rank_weights(y_raw: np.ndarray, cap: float = 20.0) -> np.ndarray:
+    """
+    R2 v3-4: Rank-based weights.  Rows with higher AQI get higher weight,
+    but the mapping is smooth (no hard thresholds) and capped at `cap`.
+    This avoids the cliff between 199 and 201 that hard-coded tier weights create.
+    """
+    ranks = pd.Series(y_raw).rank(pct=True).values          # 0..1
+    w = 1.0 + (cap - 1.0) * (ranks ** 2)                    # quadratic ramp
+    return np.clip(w, 1.0, cap)
 
 
 def train_rf(horizon: int) -> dict:
     print(f"\n{'=' * 75}\n Random Forest — {horizon}h Horizon\n{'=' * 75}")
+    run_id = _run_id()
 
-    # ── 1. Load (cache hit after first model) ─────────────────────────────────
+    # ── 1. Load ───────────────────────────────────────────────────────────────
     X, y_log, y_raw = load_xy_both(horizon)
 
-    # PERF 5: single split call; derive raw series via expm1 (no second split)
     X_train, y_train_log, X_cal, y_cal_log, X_test, y_test_log = \
         get_chronological_splits(X, y_log, horizon)
     _, y_train_raw, _, y_cal_raw, _, y_test_raw = \
         get_chronological_splits(X, y_raw, horizon)
 
-    # ── 2. Correlation filter (cached result shared with XGB and Ridge) ────────
+    # ── 2. Correlation filter ─────────────────────────────────────────────────
     X_train, X_cal, X_test, dropped_cols = apply_leakage_free_correlation_filter(
         X_train, X_test, X_cal, threshold=0.97, horizon=horizon,
     )
     print(f"Features after filter: {X_train.shape[1]}  (dropped {len(dropped_cols)})")
 
-    pd.DataFrame({"dropped_feature": dropped_cols}).to_csv(
-        METRICS_DIR / f"rf_dropped_features_{horizon}h.csv", index=False)
-    pd.DataFrame({"feature": X_train.columns}).to_csv(
-        METRICS_DIR / f"rf_features_{horizon}h.csv", index=False)
-
-    # ── 3. Hyperparameter search on ORIGINAL X_train ──────────────────────────
-    # R2 FIX 2: min_samples_leaf min raised to 4 (was 2).
-    # PERF 2: n_estimators grid capped at 400; n_iter=8 (was 15).
+    # ── 3. Hyperparameter search ──────────────────────────────────────────────
+    # R2 v3-1: Wider grid
     param_dist = {
-        "n_estimators":      [200, 300, 400],
-        "max_depth":         [15, 20, 28, None],
-        "min_samples_leaf":  [4, 6, 8, 12],      # R2 FIX 2
+        "n_estimators":      [200, 300, 400, 500, 600],   # R2 v3-1
+        "max_depth":         [15, 20, 28, 35, None],       # R2 v3-1
+        "min_samples_leaf":  [3, 4, 6, 8, 12],             # R2 v3-1 (added 3)
         "min_samples_split": [4, 6, 10, 14],
-        "max_features":      ["sqrt", 0.2, 0.3, 0.5],
+        "max_features":      ["sqrt", 0.2, 0.3, 0.4, 0.5], # R2 v3-1
     }
-    # R2 FIX 3: max_samples=0.85 added to base estimator
     base_rf   = RandomForestRegressor(
         random_state=42, n_jobs=1,
-        max_samples=0.85,           # R2 FIX 3
+        max_samples=0.90,   # R2 v3-3: was 0.85
     )
     tuning_cv = TimeSeriesSplit(n_splits=3, gap=min(horizon, 24))
 
-    # R2 FIX 4: weight cap lowered from 25× to 20×
-    sw_search = 1.0 + np.exp(np.minimum(y_train_raw.values, 350) / 110.0) - np.exp(0)
-    sw_search = np.clip(sw_search, 1.0, 20.0)   # R2 FIX 4
+    sw_search = _rank_weights(y_train_raw.values, cap=20.0)  # R2 v3-4
 
     search = RandomizedSearchCV(
         estimator=base_rf,
         param_distributions=param_dist,
-        n_iter=8,                   # PERF 2: was 15
+        n_iter=12,              # R2 v3-2: was 8
         cv=tuning_cv,
-        scoring=raw_mae_scorer,     # R2 FIX 1: raw-scale MAE
+        scoring=raw_mae_scorer,
         random_state=42,
         n_jobs=-1,
         verbose=1,
@@ -214,26 +189,18 @@ def train_rf(horizon: int) -> dict:
     )
 
     y_aug_raw_vals = np.expm1(y_train_aug.values)
-    sample_weights = 1.0 + np.exp(np.minimum(y_aug_raw_vals, 350) / 110.0) - np.exp(0)
-    sample_weights = np.clip(sample_weights, 1.0, 20.0)   # R2 FIX 4
+    sample_weights = _rank_weights(y_aug_raw_vals, cap=20.0)  # R2 v3-4
 
     # ── 5. Final model fit ────────────────────────────────────────────────────
-    # PERF 3: n_estimators fixed at 500; ignore search result if it was 700
     final_params = {**best_params, "n_estimators": min(best_params["n_estimators"], 500)}
     model = RandomForestRegressor(
         **final_params,
-        max_samples=0.85,   # R2 FIX 3
+        max_samples=0.90,   # R2 v3-3
         random_state=42,
         n_jobs=-1,
     )
     print(f"Fitting final RF (n_estimators={final_params['n_estimators']}) on augmented train set…")
     model.fit(X_train_aug, y_train_aug, sample_weight=sample_weights)
-
-    pd.DataFrame({
-        "feature":    X_train.columns,
-        "importance": model.feature_importances_,
-    }).sort_values("importance", ascending=False).to_csv(
-        METRICS_DIR / f"rf_feature_importance_{horizon}h.csv", index=False)
 
     # ── 6. Conformal calibration ──────────────────────────────────────────────
     cal_preds_log = np.clip(model.predict(X_cal), 0, None)
@@ -248,13 +215,18 @@ def train_rf(horizon: int) -> dict:
     pi_lower = np.clip(preds_raw - margin, 0, 500)
     pi_upper = np.clip(preds_raw + margin, 0, 500)
 
-    # ── 8. Save model ─────────────────────────────────────────────────────────
-    joblib.dump({
-        "model":            model,
-        "feature_names":    list(X_train.columns),
-        "conformal_margin": float(margin),
-        "use_log":          True,
-    }, MODEL_DIR / f"random_forest_{horizon}h.pkl")
+    # ── 8. Save model to MongoDB (STORE 1) ────────────────────────────────────
+    save_model_artifact(
+        model_name="RandomForest",
+        horizon=horizon,
+        artifact={
+            "model":            model,
+            "feature_names":    list(X_train.columns),
+            "conformal_margin": float(margin),
+            "use_log":          True,
+        },
+        run_id=run_id,
+    )
 
     # ── 9. Metrics ────────────────────────────────────────────────────────────
     test_rmse      = root_mean_squared_error(y_arr, preds_raw)
@@ -267,14 +239,12 @@ def train_rf(horizon: int) -> dict:
     observed_coverage = float(np.mean((y_arr >= pi_lower) & (y_arr <= pi_upper)))
     avg_interval      = float(np.mean(pi_upper - pi_lower))
 
-    mask_150 = y_arr > 150
-    n_gt150  = int(mask_150.sum())
+    mask_150 = y_arr > 150;  n_gt150 = int(mask_150.sum())
     cov_150  = float(np.mean(
         (y_arr[mask_150] >= pi_lower[mask_150]) & (y_arr[mask_150] <= pi_upper[mask_150])
     )) if n_gt150 >= 5 else 0.0
 
-    mask_200 = y_arr > 200
-    n_gt200  = int(mask_200.sum())
+    mask_200 = y_arr > 200;  n_gt200 = int(mask_200.sum())
     cov_200  = float(np.mean(
         (y_arr[mask_200] >= pi_lower[mask_200]) & (y_arr[mask_200] <= pi_upper[mask_200])
     )) if n_gt200 >= 5 else 0.0
@@ -293,58 +263,62 @@ def train_rf(horizon: int) -> dict:
         r2_imp = test_r2 - p_r2
         print(f"  Persistence baseline: {lag_col}  (MAE={p_mae:.1f}, skill={skill:.3f})")
 
-    pd.DataFrame({
-        "actual":      y_arr,
-        "predicted":   preds_raw,
-        "lower_bound": pi_lower,
-        "upper_bound": pi_upper,
-    }, index=X_test.index).to_csv(METRICS_DIR / f"rf_predictions_{horizon}h.csv", index=False)
+    # ── 10. Persist predictions & residuals to MongoDB (STORE 1) ─────────────
+    save_predictions("RandomForest", horizon, y_arr, preds_raw, pi_lower, pi_upper, run_id)
+    save_residuals("RandomForest", horizon, y_arr, preds_raw, run_id)
 
-    export_residual_diagnostics(y_arr, preds_raw, horizon, "RF", METRICS_DIR, MODEL_DIR)
+    # ── 11. Feature importance → MongoDB (STORE 1) ────────────────────────────
+    importance = model.feature_importances_.tolist()
+    save_feature_list(
+        model="RandomForest",
+        horizon=horizon,
+        feature_names=list(X_train.columns),
+        importance=importance,
+        dropped=dropped_cols,
+        run_id=run_id,
+    )
 
-    # ── 10. SHAP (PERF 4: sample size 150→100 for RF) ────────────────────────
+    # ── 12. SHAP → MongoDB (STORE 1) ──────────────────────────────────────────
     top_20 = []
     if COMPUTE_SHAP:
         import shap
         rng        = np.random.default_rng(42)
-        sample_idx = rng.choice(len(X_test), size=min(100, len(X_test)), replace=False)  # PERF 4
+        sample_idx = rng.choice(len(X_test), size=min(100, len(X_test)), replace=False)
         X_sample   = X_test.iloc[sample_idx]
 
         explainer        = shap.TreeExplainer(model)
         shap_explanation = explainer(X_sample)
         mean_abs_shap    = np.abs(shap_explanation.values).mean(axis=0)
 
-        shap_imp = pd.DataFrame({
-            "feature":       X_sample.columns,
-            "mean_abs_shap": mean_abs_shap,
-        }).sort_values("mean_abs_shap", ascending=False)
-        shap_imp.to_csv(METRICS_DIR / f"rf_top_features_{horizon}h.csv", index=False)
-        top_20 = shap_imp.head(20)["feature"].tolist()
+        save_shap(
+            model="RandomForest",
+            horizon=horizon,
+            feature_names=list(X_sample.columns),
+            mean_abs_shap=mean_abs_shap.tolist(),
+            run_id=run_id,
+        )
+        top_20 = sorted(
+            zip(X_sample.columns, mean_abs_shap),
+            key=lambda x: x[1], reverse=True,
+        )[:20]
+        top_20 = [f for f, _ in top_20]
 
         fig = plt.figure(figsize=(10, 8))
         try:
             shap.plots.beeswarm(shap_explanation, show=False)
         except Exception:
             shap.summary_plot(shap_explanation.values, X_sample, show=False)
-        plt.savefig(METRICS_DIR / f"rf_shap_summary_{horizon}h.png", dpi=150, bbox_inches="tight")
-        plt.close(fig)
+        save_shap_plot_png("RandomForest", horizon, fig, run_id)
     else:
-        top_20 = (
-            pd.DataFrame({
-                "feature":    X_train.columns,
-                "importance": model.feature_importances_,
-            })
-            .sort_values("importance", ascending=False)
-            .head(20)["feature"]
-            .tolist()
-        )
+        imp_df = pd.DataFrame({"feature": X_train.columns, "importance": model.feature_importances_})
+        top_20 = imp_df.nlargest(20, "importance")["feature"].tolist()
 
     try:
         run_data_drift_monitoring(X_train, X_test, horizon, "RF", top_20)
     except Exception as e:
         print(f"Drift monitoring skipped: {e}")
 
-    # ── 11. Build metrics dict ────────────────────────────────────────────────
+    # ── 13. Metrics dict → MongoDB (STORE 1) ──────────────────────────────────
     metrics = {
         "model":                        "RandomForest",
         "horizon":                      f"{horizon}h",
@@ -376,9 +350,7 @@ def train_rf(horizon: int) -> dict:
         **events_200,
     }
 
-    with open(METRICS_DIR / f"rf_metrics_{horizon}h.json", "w") as f:
-        json.dump(metrics, f, indent=2)
-
+    save_metrics("RandomForest", horizon, metrics, run_id)
     return metrics
 
 

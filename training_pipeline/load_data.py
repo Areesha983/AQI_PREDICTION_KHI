@@ -137,21 +137,35 @@ def _build_X_y(df: pd.DataFrame, horizon: int):
 
 
 def load_xy_both(horizon: int) -> tuple:
-    """Returns (X, y_log, y_raw), checking for local cached files first to accommodate runners."""
+    """
+    Returns (X, y_log, y_raw).
+
+    Resolution order:
+      1. In-process RAM cache (_DATA_CACHE) — free if same process.
+      2. Parquet snapshot written by run_training_pipeline.py Phase 0.
+      3. Full MongoDB fetch (fallback, also populates RAM cache).
+    """
     assert horizon in (12, 24, 48, 72), "Horizon must be 12, 24, 48, or 72."
-
-    # ── GITHUB ACTIONS WORKSPACE RUNNER INTERCEPT ──
-    local_X     = SCRIPT_DIR / f"X_cache_{horizon}h.pkl"
-    local_y_log = SCRIPT_DIR / f"y_log_cache_{horizon}h.pkl"
-    local_y_raw = SCRIPT_DIR / f"y_raw_cache_{horizon}h.pkl"
-
-    if local_X.exists() and local_y_log.exists() and local_y_raw.exists():
-        print(f"  [CI/CD Workspace] Intercepted localized data binary for {horizon}h. Loading from disk.")
-        return pd.read_pickle(local_X), pd.read_pickle(local_y_log), pd.read_pickle(local_y_raw)
 
     if horizon in _DATA_CACHE:
         return _DATA_CACHE[horizon]
 
+    # ── Parquet cache intercept (written by Phase 0 across separate steps) ──
+    PARQUET_DIR  = SCRIPT_DIR / "_parquet_cache"
+    pq_X        = PARQUET_DIR / f"X_{horizon}h.parquet"
+    pq_y_log    = PARQUET_DIR / f"y_log_{horizon}h.parquet"
+    pq_y_raw    = PARQUET_DIR / f"y_raw_{horizon}h.parquet"
+
+    if pq_X.exists() and pq_y_log.exists() and pq_y_raw.exists():
+        print(f"  [Phase-0 cache] Loading Parquet snapshot for {horizon}h.")
+        X     = pd.read_parquet(pq_X)
+        y_log = pd.read_parquet(pq_y_log)["y_log"]
+        y_raw = pd.read_parquet(pq_y_raw)["y_raw"]
+        result = (X, y_log, y_raw)
+        _DATA_CACHE[horizon] = result
+        return result
+
+    # ── Full MongoDB fetch ───────────────────────────────────────────────────
     df = _fetch_from_feature_store()
     result = _build_X_y(df, horizon)
     _DATA_CACHE[horizon] = result

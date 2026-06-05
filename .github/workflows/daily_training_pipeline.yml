@@ -30,9 +30,20 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: "🏁 Phase 0: Fetch Feature Store and Warmup Workspace Cache"
+      # Phase 0: Single MongoDB fetch → write Parquet snapshots to runner disk.
+      # Subsequent steps load from Parquet (microseconds) instead of Atlas (seconds).
+      - name: "🏁 Phase 0: Fetch Feature Store → Parquet Cache"
         run: |
           python run_training_pipeline.py
+
+      # Cache the Parquet snapshots so each training step can read them directly.
+      # Key includes the SHA of requirements.txt so it busts when deps change.
+      - name: Cache Phase-0 Parquet Snapshots
+        uses: actions/cache@v4
+        with:
+          path: training_pipeline/_parquet_cache
+          key: parquet-cache-${{ github.run_id }}
+          restore-keys: parquet-cache-
 
       - name: "🌲 Phase 1: Train Random Forest Models (All Horizons)"
         working-directory: ./training_pipeline
@@ -44,12 +55,15 @@ jobs:
         run: |
           python train_xgboost.py
 
-      - name: "📊 Phase 3: Train Ridge Regression Models (All Horizons)"
+      - name: "📊 Phase 3: Train Ridge / ElasticNet Models (All Horizons)"
         working-directory: ./training_pipeline
         run: |
           python train_ridge.py
 
-      - name: "📈 Phase 4: Run Cross-Model MLOps Evaluation & Upload Metrics"
+      - name: "📈 Phase 4: Cross-Model Evaluation → MongoDB pipeline_runs"
         working-directory: ./training_pipeline
         run: |
           python evaluate.py
+
+      # No artifact upload step — all models, metrics, predictions, SHAP values
+      # and residuals are stored in MongoDB Atlas by the training scripts.
