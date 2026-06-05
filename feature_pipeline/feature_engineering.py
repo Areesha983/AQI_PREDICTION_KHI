@@ -498,7 +498,7 @@ def build_features(df_raw: pd.DataFrame) -> pd.DataFrame:
 # The maximum lookback any rolling/lag feature needs. aqi_lag_336 and
 # pm25_lag_336 both look back 336 hours, so we must always load that many
 # context rows before the first truly-new row to get accurate feature values.
-_MAX_LOOKBACK_HOURS = 336
+_MAX_LOOKBACK_HOURS = 800
 
 def _get_latest_processed_datetime(output_collection) -> pd.Timestamp | None:
     """Returns the datetime of the most-recently stored processed feature row, or None."""
@@ -527,9 +527,24 @@ def process_all():
     input_collection  = db["karachi_aqi_dataset"]
     output_collection = db["processed_features"]
 
-    # Ensure indexes exist for fast range queries on both collections
-    input_collection.create_index("datetime", background=True)
-    output_collection.create_index("datetime", unique=True, background=True)
+    # Ensure indexes exist safely (works on fresh DBs and existing deployments)
+    def ensure_datetime_index(collection, unique=False):
+        try:
+            indexes = collection.index_information()
+            for idx in indexes.values():
+                if idx.get("key") == [("datetime", 1)]:
+                    if idx.get("unique", False) == unique:
+                        return
+            collection.create_index(
+                [("datetime", pymongo.ASCENDING)],
+                unique=unique,
+                background=True,
+            )
+        except Exception as e:
+            print(f" -> Index check warning: {e}")
+
+    ensure_datetime_index(input_collection, unique=True)
+    ensure_datetime_index(output_collection, unique=True)
 
     # ── Determine the incremental window ──────────────────────────────────────
     latest_processed = _get_latest_processed_datetime(output_collection)
