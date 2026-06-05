@@ -2,48 +2,31 @@
 AirLyst Karachi — AQI Intelligence Dashboard
 Streamlit frontend consuming a Flask prediction microservice.
 
-FIXES IN THIS VERSION:
-  BUG 1 — WRONG IMPORT `from database import db, COLLECTION_NAME`
-    database.py has no module-level `db` object. This raised ImportError
-    on every cold start, fell to the bare except, and returned all-zero
-    DataFrames which the charts rendered silently as flat lines.
-    FIX: removed the broken import entirely. Metrics now come from Flask.
+FIXES IN THIS VERSION (on top of previous BUG 1–6 fixes):
 
-  BUG 2 — HARDCODED METRIC SEEDS
-    The original fallback block fabricated numbers
-    ({"Random Forest": {"R2": 0.84, ...}}) when model_metrics had no
-    matching document. User requirement: "all data from mongodb only".
-    FIX: hardcoded seeds removed. If the Flask API returns no real data
-    an st.error() is shown so the cause is immediately visible.
+  FIX A — _fallback_pred() was fabricating AQI numbers using hardcoded math
+    when Flask was unreachable. This violated the "all data from MongoDB only"
+    requirement and silently showed made-up predictions with no indication they
+    were fake. Removed entirely. Sections that cannot reach Flask now show an
+    explicit st.error() / st.warning() so the user knows the data is missing.
 
-  BUG 3 — WRONG METRICS QUERY FILTER
-    db["model_metrics"].find_one({"type": "automated_pipeline_evaluation"})
-    This filter matches nothing unless evaluate.py writes that exact field,
-    so latest_record was always None, triggering the seed fallback.
-    FIX: metrics are now fetched from Flask's /metrics/all endpoint which
-    already has the correct multi-attempt query + schema normalisation logic.
+  FIX B — inference_payload had two hardcoded constants:
+      "pm25_diff_1h":     2.3
+      "pm25_roll_std_24h": 12.4
+    These are features the model uses, so feeding wrong values silently biases
+    every prediction. They are now seeded from mongo_features (same lookup
+    pattern as the slider seeds) with documented fallback to 0.0 when the
+    processed_features collection doesn't contain them yet.
 
-  BUG 4 — METRICS BYPASSED FLASK ENTIRELY
-    Section 3 opened its own direct PyMongo connection instead of calling
-    Flask's /metrics/all route. This duplicated (and broke) the schema
-    parsing that api/app.py already handles correctly.
-    FIX: _fetch_metrics_from_api() calls GET /metrics/all via requests,
-    exactly the same pattern used for /predict.
+  FIX C — _load_mongo_features() used a bare `except: pass` that swallowed
+    every error silently. It now captures and surfaces the exception message
+    so the user knows whether the issue is a missing MONGODB_URI, a network
+    block, or an empty collection.
 
-  BUG 5 — BARE EXCEPT SWALLOWED ALL ERRORS AND CACHED ZEROS
-    A single try/except around the whole function caught BUGs 1-4 silently
-    and returned zeros. @st.cache_data(ttl=15) then froze those zeros for
-    15 s per page load with no user-visible indication of failure.
-    FIX: errors are surfaced via st.error()/st.warning() so the user
-    knows whether the Flask API is unreachable or the collection is empty.
-
-  BUG 6 — SIDEBAR SLIDER SEEDS USED WRONG FIELD NAMES
-    _d("pm25", 75.0) looked up "pm25" in the processed_features document,
-    but that collection stores lag features as "pm25_lag_1". The lookup
-    always missed, mongo_active showed green, and sliders stayed at the
-    hardcoded defaults.
-    FIX: _d() now tries the lag-1 key first ("pm25_lag_1"), then falls
-    back to the raw key ("pm25"), then to the supplied default.
+  FIX D — _fetch_prediction() used a 2-second timeout. Flask deserialises the
+    model artifact from MongoDB base64 on first call which can take 3–5 s on a
+    cold start. The timeout is raised to 15 s to prevent silent fallback to
+    fabricated numbers on a healthy but cold Flask instance.
 """
 
 import streamlit as st
@@ -200,29 +183,33 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("##### 🎯 Input Vectors")
 
-    # ── BUG 6 FIX: seed sliders from MongoDB using correct lag-1 field names ──
-    # processed_features stores "pm25_lag_1", not "pm25". The original _d()
-    # only checked the raw key and always missed, keeping sliders at hardcoded
-    # defaults while incorrectly showing the green "Mongo feature store" dot.
+    # ── Seed sliders from MongoDB using correct lag-1 field names ─────────────
+    # processed_features stores "pm25_lag_1", not "pm25". Try lag key first,
+    # then raw key, then the supplied default.
     @st.cache_data(ttl=30)
-    def _load_mongo_features():
+    def _load_mongo_features() -> tuple[dict, bool, str | None]:
+        """
+        Returns (features_dict, is_active, error_message).
+
+        FIX C: was bare `except: pass` which swallowed all errors silently.
+        Now returns the error string so the sidebar can show the user why
+        the feature store is unavailable.
+        """
         if not _DB_AVAILABLE:
-            return {}, False
+            return {}, False, "database.py not found — cannot import get_latest_features."
         try:
             rec = get_latest_features()
             if rec and isinstance(rec, dict):
-                return rec, True
-        except Exception:
-            pass
-        return {}, False
+                return rec, True, None
+            return {}, False, "get_latest_features() returned None — processed_features collection may be empty."
+        except Exception as exc:
+            return {}, False, str(exc)
 
-    mongo_features, mongo_active = _load_mongo_features()
+    mongo_features, mongo_active, mongo_error = _load_mongo_features()
 
     def _d(raw_key: str, lag_key: str, default: float) -> float:
-        """
-        BUG 6 FIX: Try lag-1 field name first (how processed_features stores
-        it), then the raw field name, then fall back to the supplied default.
-        """
+        """Try lag-1 field name first (how processed_features stores it),
+        then the raw field name, then fall back to the supplied default."""
         for k in (lag_key, raw_key):
             v = mongo_features.get(k)
             if v is not None:
@@ -246,8 +233,17 @@ with st.sidebar:
         </div>
     """, unsafe_allow_html=True)
 
+    # FIX C: surface the reason the feature store is unavailable
+    if not mongo_active and mongo_error:
+        st.caption(f"⚠️ {mongo_error}")
+
 
 # ─── INFERENCE PAYLOAD ───────────────────────────────────────────────────────
+# FIX B: pm25_diff_1h and pm25_roll_std_24h were hardcoded constants (2.3 and
+# 12.4). They are now seeded from mongo_features using the same lag-key lookup
+# pattern as the sliders. Falls back to 0.0 when the field isn't present yet —
+# which is safe because Flask's _build_feature_vector() also fills missing
+# features with 0.0 using the latest MongoDB doc as base.
 inference_payload = {
     "features": {
         "pm25":                          sim_pm25,
@@ -255,8 +251,8 @@ inference_payload = {
         "temperature":                   sim_temp,
         "humidity":                      sim_humidity,
         "wind_speed":                    sim_wind,
-        "pm25_diff_1h":                  2.3,
-        "pm25_roll_std_24h":             12.4,
+        "pm25_diff_1h":                  _d("pm25_diff_1h",     "pm25_diff_1h",     0.0),
+        "pm25_roll_std_24h":             _d("pm25_roll_std_24h","pm25_roll_std_24h", 0.0),
         "interaction_pm25_humidity":     sim_pm25 * sim_humidity,
         "interaction_pm25_wind_inverse": sim_pm25 / (sim_wind + 0.1),
     }
@@ -285,31 +281,35 @@ st.markdown(f"""
 
 # ─── HELPER: single-horizon prediction request ───────────────────────────────
 def _fetch_prediction(model_key: str, horizon: int) -> dict | None:
+    """
+    FIX D: timeout raised from 2s → 15s.
+    Flask deserialises the model artifact from MongoDB base64 on the first
+    call which can take 3–5 s on a cold runner. 2 s caused silent fallback
+    to fabricated numbers even when Flask was healthy.
+    """
     try:
         r = requests.post(
             f"{api_gateway}/predict/{model_key}/{horizon}",
             json=inference_payload,
-            timeout=2,
+            timeout=15,
         )
         if r.status_code == 200:
             return r.json()
-    except Exception:
-        pass
+        # Surface non-200 responses so the user knows what went wrong
+        st.warning(
+            f"Flask returned HTTP {r.status_code} for {model_key}/{horizon}h. "
+            f"Response: {r.text[:200]}"
+        )
+    except requests.exceptions.ConnectionError:
+        pass   # handled at call site — Flask unreachable message shown once
+    except requests.exceptions.Timeout:
+        st.warning(
+            f"Flask timed out for {model_key}/{horizon}h. "
+            "The model artifact may still be loading from MongoDB — try refreshing."
+        )
+    except Exception as exc:
+        st.warning(f"Unexpected error calling Flask ({model_key}/{horizon}h): {exc}")
     return None
-
-
-def _fallback_pred(model_key: str, horizon: int) -> dict:
-    mod    = 1.0 if model_key == "ridge" else 1.2 if model_key == "xgboost" else 1.1
-    scalar = {24: 1.5, 48: 1.8, 72: 2.1}[horizon] * mod
-    pred   = round(max(10.0, min(490.0, (sim_pm25 * scalar) + (sim_temp * 0.3) - (sim_wind * 0.6))), 1)
-    tier   = get_epa_tier_details(pred)
-    return {
-        "aqi_prediction":   pred,
-        "lower_bound_95ci": round(max(0.0, pred - 18.2), 1),
-        "upper_bound_95ci": round(min(500.0, pred + 18.2), 1),
-        "epa_category":     tier["label"],
-        "_source":          "fallback",
-    }
 
 
 # ─── SECTION 1: MULTI-HORIZON FORECASTS ─────────────────────────────────────
@@ -320,38 +320,81 @@ gauge_cols  = st.columns(3, gap="medium")
 detail_cols = st.columns(3, gap="medium")
 horizons    = [24, 48, 72]
 
+# Check Flask reachability once before looping to avoid repeating the same
+# connection-error message three times (once per horizon).
+_flask_reachable = True
+try:
+    requests.get(f"{api_gateway}/health", timeout=5)
+except requests.exceptions.ConnectionError:
+    _flask_reachable = False
+    st.error(
+        f"**Cannot reach Flask API at `{api_gateway}`.**\n\n"
+        "Start the API with `python api/app.py` and reload this page. "
+        "Predictions require a live connection — no fabricated fallback values are shown."
+    )
+except Exception:
+    pass  # non-connection errors (e.g. bad URL) will surface per-prediction below
+
 for idx, h in enumerate(horizons):
-    raw  = _fetch_prediction(active_model_key, h)
-    data = raw if raw else _fallback_pred(active_model_key, h)
-    pred = data["aqi_prediction"]
-    low  = data["lower_bound_95ci"]
-    high = data["upper_bound_95ci"]
-    tier = get_epa_tier_details(pred)
-    src  = "live" if raw else "fallback"
+    data = None
+    if _flask_reachable:
+        data = _fetch_prediction(active_model_key, h)
 
     with gauge_cols[idx]:
-        fig = plot_aqi_gauge(pred, tier, f"{h}h Forecast")
-        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+        if data:
+            pred = data["aqi_prediction"]
+            tier = get_epa_tier_details(pred)
+            fig  = plot_aqi_gauge(pred, tier, f"{h}h Forecast")
+            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+        else:
+            # FIX A: show a placeholder instead of fabricated numbers
+            st.markdown(
+                f"""<div class="card" style="text-align:center; padding:40px 20px;">
+                    <div style="font-size:0.75rem; color:#475569; font-family:'JetBrains Mono',monospace;">
+                        {h}h Forecast
+                    </div>
+                    <div style="font-size:1.1rem; color:#334155; margin-top:12px;">
+                        — unavailable —
+                    </div>
+                </div>""",
+                unsafe_allow_html=True,
+            )
 
     with detail_cols[idx]:
-        st.markdown(f"""
-        <div class="card" style="border-left: 3px solid {tier['color']}; background:{tier['bg']};">
-            <div style="font-size:0.68rem; color:#475569; text-transform:uppercase;
-                        letter-spacing:0.1em; margin-bottom:10px; font-family:'JetBrains Mono',monospace;">
-                95% CI &nbsp;·&nbsp;
-                <span style="color:{'#10b981' if src == 'live' else '#f59e0b'};">
-                    {'● live' if src == 'live' else '◌ est.'}
-                </span>
+        if data:
+            pred = data["aqi_prediction"]
+            low  = data["lower_bound_95ci"]
+            high = data["upper_bound_95ci"]
+            tier = get_epa_tier_details(pred)
+            src  = "live"
+            st.markdown(f"""
+            <div class="card" style="border-left: 3px solid {tier['color']}; background:{tier['bg']};">
+                <div style="font-size:0.68rem; color:#475569; text-transform:uppercase;
+                            letter-spacing:0.1em; margin-bottom:10px; font-family:'JetBrains Mono',monospace;">
+                    95% CI &nbsp;·&nbsp;
+                    <span style="color:#10b981;">● live</span>
+                </div>
+                <div style="font-size:1.5rem; font-weight:700; color:{tier['color']};
+                            font-family:'JetBrains Mono',monospace; letter-spacing:-0.02em;">
+                    {low} – {high}
+                </div>
+                <div style="font-size:0.73rem; color:#64748b; margin-top:10px; line-height:1.5;">
+                    {tier['advice']}
+                </div>
             </div>
-            <div style="font-size:1.5rem; font-weight:700; color:{tier['color']};
-                        font-family:'JetBrains Mono',monospace; letter-spacing:-0.02em;">
-                {low} – {high}
-            </div>
-            <div style="font-size:0.73rem; color:#64748b; margin-top:10px; line-height:1.5;">
-                {tier['advice']}
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
+            """, unsafe_allow_html=True)
+        else:
+            st.markdown(
+                f"""<div class="card" style="border-left:3px solid #334155;">
+                    <div style="font-size:0.68rem; color:#475569; font-family:'JetBrains Mono',monospace;">
+                        95% CI &nbsp;·&nbsp; <span style="color:#f59e0b;">◌ unavailable</span>
+                    </div>
+                    <div style="font-size:0.78rem; color:#334155; margin-top:10px;">
+                        Flask API unreachable or model not trained yet.
+                    </div>
+                </div>""",
+                unsafe_allow_html=True,
+            )
 
 
 # ─── SECTION 2: CROSS-MODEL BENCHMARKING ────────────────────────────────────
@@ -368,33 +411,36 @@ for idx, m_key in enumerate(all_models):
         st.markdown(f"**{model_labels[m_key]}**")
         rows = []
         for h in horizons:
-            raw  = _fetch_prediction(m_key, h)
-            data = raw if raw else _fallback_pred(m_key, h)
-            pred = data["aqi_prediction"]
-            tier = get_epa_tier_details(pred)
-            rows.append((h, pred, tier))
+            data = _fetch_prediction(m_key, h) if _flask_reachable else None
+            if data:
+                rows.append((h, data["aqi_prediction"], get_epa_tier_details(data["aqi_prediction"])))
 
-        cards_html = ""
-        for h, pred, tier in rows:
-            cards_html += f"""
-            <div style="display:flex; justify-content:space-between; align-items:center;
-                        padding:10px 14px; margin-bottom:8px; border-radius:10px;
-                        background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.06);">
-                <span style="font-size:0.78rem; color:#64748b; font-family:'JetBrains Mono',monospace;">{h}h</span>
-                <span style="font-size:0.78rem; font-weight:700; color:{tier['color']};
-                             font-family:'JetBrains Mono',monospace;">{int(pred)}</span>
-                <span style="font-size:0.65rem; color:{tier['color']}; opacity:0.7;">{tier['label']}</span>
-            </div>"""
-
-        st.markdown(f'<div style="margin-top:8px;">{cards_html}</div>', unsafe_allow_html=True)
+        if rows:
+            cards_html = ""
+            for h, pred, tier in rows:
+                cards_html += f"""
+                <div style="display:flex; justify-content:space-between; align-items:center;
+                            padding:10px 14px; margin-bottom:8px; border-radius:10px;
+                            background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.06);">
+                    <span style="font-size:0.78rem; color:#64748b; font-family:'JetBrains Mono',monospace;">{h}h</span>
+                    <span style="font-size:0.78rem; font-weight:700; color:{tier['color']};
+                                 font-family:'JetBrains Mono',monospace;">{int(pred)}</span>
+                    <span style="font-size:0.65rem; color:{tier['color']}; opacity:0.7;">{tier['label']}</span>
+                </div>"""
+            st.markdown(f'<div style="margin-top:8px;">{cards_html}</div>', unsafe_allow_html=True)
+        else:
+            # FIX A: no fabricated fallback — show explicit unavailable state
+            st.markdown(
+                """<div style="padding:16px; border-radius:10px; background:rgba(255,255,255,0.02);
+                              border:1px solid rgba(255,255,255,0.05); font-size:0.78rem;
+                              color:#334155; font-family:'JetBrains Mono',monospace;">
+                    — unavailable —
+                </div>""",
+                unsafe_allow_html=True,
+            )
 
 
 # ─── SECTION 3: MODEL EVALUATION CHARTS ─────────────────────────────────────
-# BUG 1-5 FIX: This section previously attempted a direct PyMongo connection
-# using `from database import db` (which doesn't exist), fell to a bare except,
-# and returned hardcoded zeros. It now calls the Flask /metrics/all endpoint —
-# the same API the rest of the dashboard already uses — which has full schema
-# normalisation and multi-attempt querying built in.
 st.markdown("<hr>", unsafe_allow_html=True)
 st.markdown("### 📊 Live Model Evaluation Metrics")
 st.caption(
@@ -403,7 +449,7 @@ st.caption(
 )
 
 
-@st.cache_data(ttl=300)  # 5-min TTL — matches Flask's own _METRICS_CACHE TTL
+@st.cache_data(ttl=300)
 def _fetch_metrics_from_api(gateway: str) -> tuple[pd.DataFrame, str | None]:
     """
     Calls GET /metrics/all on the Flask API and unpacks the response into a
@@ -411,10 +457,6 @@ def _fetch_metrics_from_api(gateway: str) -> tuple[pd.DataFrame, str | None]:
 
     Returns (DataFrame, error_message). If error_message is not None the
     DataFrame will be empty and the caller should surface the error.
-
-    BUG 1-5 FIX: replaces the broken direct-PyMongo approach with a clean
-    HTTP call to Flask, which already handles all MongoDB querying and schema
-    normalisation correctly.
     """
     model_name_map = {
         "random_forest": "Random Forest",
@@ -458,8 +500,6 @@ def _fetch_metrics_from_api(gateway: str) -> tuple[pd.DataFrame, str | None]:
             horizon_key = str(h)
             h_data = model_data.get(horizon_key, {})
 
-            # BUG 5 FIX: surface the error key that api/app.py now emits
-            # instead of zeros — so the user sees a real message, not a flat chart.
             if "error" in h_data:
                 errors.append(f"{display_name} / {h}h: {h_data['error']}")
                 continue
@@ -469,7 +509,6 @@ def _fetch_metrics_from_api(gateway: str) -> tuple[pd.DataFrame, str | None]:
             mae      = float(h_data.get("mae",      0.0))
             coverage = float(h_data.get("coverage", 0.0))
 
-            # Use RMSE if available, fall back to MAE (evaluate.py may write either)
             error_value = rmse if rmse != 0.0 else mae
 
             if r2 == 0.0 and error_value == 0.0:
@@ -499,7 +538,6 @@ def _fetch_metrics_from_api(gateway: str) -> tuple[pd.DataFrame, str | None]:
 metrics_df, metrics_error = _fetch_metrics_from_api(api_gateway)
 
 if metrics_error and metrics_df.empty:
-    # Fatal — nothing to plot
     st.error(
         f"**Model metrics unavailable.**\n\n{metrics_error}\n\n"
         "Run the training + evaluation pipeline, or check that "
@@ -507,7 +545,6 @@ if metrics_error and metrics_df.empty:
         "Use `GET /debug/metrics_raw` on the Flask API to inspect what is stored."
     )
 elif metrics_error:
-    # Partial data — plot what we have and warn about the gaps
     st.warning(f"Some metric horizons are missing from MongoDB:\n\n{metrics_error}")
 
 if not metrics_df.empty:
