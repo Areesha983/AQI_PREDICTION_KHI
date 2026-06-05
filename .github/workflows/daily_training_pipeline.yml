@@ -4,7 +4,7 @@ on:
   schedule:
     # Runs once a day at midnight UTC (05:00 AM Karachi Time)
     - cron: '0 0 * * *'
-  # Allows manual execution from the GitHub Actions tab anytime
+  # Re-enables the manual execution drop-down menu in GitHub Actions
   workflow_dispatch:
 
 env:
@@ -15,7 +15,6 @@ env:
 jobs:
   retrain-models:
     runs-on: ubuntu-latest
-    # Fail-safe protection: Prevents actions from hanging for hours if an external link stalls
     timeout-minutes: 15
     
     steps:
