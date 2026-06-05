@@ -1,34 +1,14 @@
 """
-train_ridge.py  (OPTIMISED)
+train_ridge.py  (OPTIMISED & SYNTAX CORRECTED)
 --------------
 Speed fixes:
   PERF 1 — MongoDB data comes from in-process cache.
-
-  PERF 2 — CV loop: n_splits reduced 4→3.  Ridge with StandardScaler is fast,
-    so this is a minor saving, but every second counts on a 3-hour pipeline.
+  PERF 2 — CV loop: n_splits reduced 4→3.
 
 R² fixes:
-  R2 FIX 1 — RidgeCV now uses TimeSeriesSplit(n_splits=5) instead of default
-    k-fold.  Standard k-fold on time-series data leaks future rows into training
-    folds, making alpha selection overconfident.  This alone can recover
-    0.03–0.08 R² by picking a better-regularised alpha.
-
-  R2 FIX 2 — Alpha grid extended to include very small values (1e-4) and very
-    large (1e4).  The previous range 1e-3..1e3 was truncated; some AQI feature
-    matrices benefit from stronger regularisation.
-
-  R2 FIX 3 — Added PolynomialFeatures(degree=2, interaction_only=True) for a
-    small set of high-importance lag features.  Ridge is a linear model, so
-    interaction terms are the primary lever for capturing non-linear AQI
-    dynamics without switching to a tree model.  We keep only interactions
-    (not squares) to limit the feature explosion.
-    NOTE: Set USE_INTERACTIONS = False to skip this if feature count is already
-    large (>200) — the extra dimensionality can hurt more than help.
-
-  Prior fixes retained:
-    FIX 1 — conformal_margin alias in saved metrics JSON.
-    FIX 2 — Updated get_chronological_splits (75/10/15 + capped gap).
-    FIX 3 — apply_leakage_free_correlation_filter with keep-most-variance.
+  R2 FIX 1 — RidgeCV uses TimeSeriesSplit(n_splits=5) instead of default k-fold.
+  R2 FIX 2 — Alpha grid extended to include 1e-4 to 1e4.
+  R2 FIX 3 — Added PolynomialFeatures for high-importance lag features (Fixed 'cross' scope leak).
 """
 
 from pathlib import Path
@@ -104,14 +84,15 @@ def _add_interaction_terms(
 
     poly = PolynomialFeatures(degree=2, interaction_only=True, include_bias=False)
     poly.fit(X_train[interact_cols].fillna(0))
+    
+    # Extract the names globally so it can be referenced in the print function below safely
+    all_names = poly.get_feature_names_out(interact_cols)
+    cross_terms = [n for n in all_names if " " in n]
+    cross_idx = [list(all_names).index(n) for n in cross_terms]
 
     def _transform(df):
-        arr   = poly.transform(df[interact_cols].fillna(0))
-        names = poly.get_feature_names_out(interact_cols)
-        # Only keep the cross terms (not the original features, already in X)
-        cross = [n for n in names if " " in n]
-        cross_idx = [list(names).index(n) for n in cross]
-        return pd.DataFrame(arr[:, cross_idx], columns=cross, index=df.index)
+        arr = poly.transform(df[interact_cols].fillna(0))
+        return pd.DataFrame(arr[:, cross_idx], columns=cross_terms, index=df.index)
 
     X_train_i = pd.concat([X_train.reset_index(drop=True),
                             _transform(X_train).reset_index(drop=True)], axis=1)
@@ -120,8 +101,8 @@ def _add_interaction_terms(
     X_test_i  = pd.concat([X_test.reset_index(drop=True),
                             _transform(X_test).reset_index(drop=True)], axis=1)
 
-    print(f"  [Ridge] Added {len(cross)} interaction terms. "
-          f"Total features: {X_train_i.shape[1]}")
+    # FIX: Using 'cross_terms' which is cleanly scoped within the function body layout
+    print(f"  [Ridge] Added {len(cross_terms)} interaction terms. Total features: {X_train_i.shape[1]}")
     return X_train_i, X_cal_i, X_test_i
 
 
@@ -155,7 +136,6 @@ def train_ridge(horizon: int) -> dict:
     print("Linear imputation applied (train-mean, fitted on X_train only).")
 
     # ── 3. TimeSeries CV folds ────────────────────────────────────────────────
-    # PERF 2: n_splits 4→3
     n_splits  = 3
     tscv      = TimeSeriesSplit(n_splits=n_splits, gap=min(horizon, 24))
     fold_rmse = []
@@ -164,7 +144,6 @@ def train_ridge(horizon: int) -> dict:
     for train_idx, val_idx in tscv.split(X_train):
         fold_pipe = Pipeline([
             ("scaler", StandardScaler()),
-            # R2 FIX 1/2: TimeSeriesSplit CV inside RidgeCV; extended alpha grid
             ("ridge",  RidgeCV(
                 alphas=np.logspace(-4, 4, 30),
                 cv=TimeSeriesSplit(n_splits=3),
@@ -178,7 +157,6 @@ def train_ridge(horizon: int) -> dict:
         ))
 
     # ── 4. Final model fit ────────────────────────────────────────────────────
-    # R2 FIX 1/2: TimeSeriesSplit CV; extended alpha grid
     model = Pipeline([
         ("scaler", StandardScaler()),
         ("ridge",  RidgeCV(
@@ -234,7 +212,6 @@ def train_ridge(horizon: int) -> dict:
     lag_col = get_persistence_baseline_col(X_test, horizon)
     p_mae = p_r2 = skill = r2_imp = 0.0
     if lag_col:
-        # lag_col may have been renamed by interaction expansion; look up original
         base_lag = lag_col
         if base_lag not in X_test.columns:
             base_lag = next((c for c in X_test.columns if c == lag_col), None)

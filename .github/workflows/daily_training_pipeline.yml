@@ -10,12 +10,13 @@ on:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   MONGODB_URI: ${{ secrets.MONGO_CONNECTION_STRING }}
-  # Cleaned up: Only needs the training folder context now!
   PYTHONPATH: "training_pipeline"
 
 jobs:
   retrain-models:
     runs-on: ubuntu-latest
+    # Fail-safe protection: Prevents actions from hanging for hours if an external link stalls
+    timeout-minutes: 15
     
     steps:
       - name: Checkout Code Repository
