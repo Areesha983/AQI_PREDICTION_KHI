@@ -16,10 +16,10 @@ import pandas as pd
 from datetime import datetime, timedelta
 
 # Import the updated extraction subroutines and config helpers
-# Import the updated extraction subroutines and config helpers safely using relative package imports
-from . import fetch_air_quality
-from . import fetch_weather
-from .config import HISTORICAL_START_DATE, get_end_date
+# Import the subroutines directly using standard absolute imports
+import fetch_air_quality
+import fetch_weather
+from config import HISTORICAL_START_DATE, get_end_date
 
 MAX_GAP_FILL_HOURS = 3
 BULK_BATCH_SIZE    = 1000
