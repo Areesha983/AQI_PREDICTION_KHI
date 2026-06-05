@@ -49,10 +49,24 @@ def main():
     print(" CONSOLIDATING WEATHER AND AIR QUALITY RECORDS")
     print("=" * 70)
 
-    # 2. OPTIMIZATION: Isolate connection range to the active sliding tracking window
-    # We look back 5 days from today to guarantee we catch the 72 hours just downloaded,
-    # avoiding a full collection scan over the remote cloud network.
-    tracking_lookback = (datetime.today() - timedelta(days=5)).strftime("%Y-%m-%d %H:%M:%S")
+    # 2. OPTIMIZATION: Determine the merge window dynamically.
+    # Check the latest datetime already in karachi_aqi_dataset and only re-merge rows
+    # newer than that (with a 2-day safety buffer for rows stored with missing AQ values).
+    # Falls back to a 5-day window when the collection is empty (first run).
+    dataset_collection = db["karachi_aqi_dataset"]
+    latest_dataset_doc = dataset_collection.find_one(
+        filter={},
+        projection={"datetime": 1, "_id": 0},
+        sort=[("datetime", pymongo.DESCENDING)],
+    )
+    if latest_dataset_doc and "datetime" in latest_dataset_doc:
+        latest_dt = datetime.strptime(latest_dataset_doc["datetime"], "%Y-%m-%d %H:%M:%S")
+        lookback_dt = latest_dt - timedelta(days=2)
+        tracking_lookback = lookback_dt.strftime("%Y-%m-%d %H:%M:%S")
+        print(f" -> Dataset collection latest row: {latest_dataset_doc['datetime']}.")
+    else:
+        tracking_lookback = (datetime.today() - timedelta(days=5)).strftime("%Y-%m-%d %H:%M:%S")
+        print(" -> Dataset collection is empty. Falling back to 5-day merge window.")
     print(f"Filtering extraction query to active sync frame (>= {tracking_lookback})...")
     
     query_filter = {"datetime": {"$gte": tracking_lookback}}
@@ -104,6 +118,8 @@ def main():
 
     if records:
         output_collection = db["karachi_aqi_dataset"]
+        # Ensure datetime index exists so range queries stay fast on every run
+        output_collection.create_index("datetime", unique=True, background=True)
         print(f"Saving {len(records):,} synced entries via fast bulk execution...")
 
         operations = [

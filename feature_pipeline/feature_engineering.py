@@ -495,30 +495,95 @@ def build_features(df_raw: pd.DataFrame) -> pd.DataFrame:
 
 # ── 3. Production Pipeline Entrypoint ─────────────────────────────────────────
 
+# The maximum lookback any rolling/lag feature needs. aqi_lag_336 and
+# pm25_lag_336 both look back 336 hours, so we must always load that many
+# context rows before the first truly-new row to get accurate feature values.
+_MAX_LOOKBACK_HOURS = 336
+
+def _get_latest_processed_datetime(output_collection) -> pd.Timestamp | None:
+    """Returns the datetime of the most-recently stored processed feature row, or None."""
+    latest = output_collection.find_one(
+        filter={},
+        projection={"datetime": 1, "_id": 0},
+        sort=[("datetime", pymongo.DESCENDING)],
+    )
+    if latest and "datetime" in latest:
+        return pd.to_datetime(latest["datetime"])
+    return None
+
+
 def process_all():
     mongo_uri = os.getenv("MONGODB_URI")
     if not mongo_uri:
         raise ValueError("CRITICAL: MONGODB_URI missing from environment contexts.")
 
     print("\n" + "=" * 70)
-    print(" EXTRACTING INPUT ALIGNED ARTIFACT FROM MONGODB")
+    print(" INCREMENTAL FEATURE ENGINEERING — SYNC CHECK")
     print("=" * 70)
 
     client = pymongo.MongoClient(mongo_uri)
     db     = client["karachi_aqi"]
 
-    cursor = db["karachi_aqi_dataset"].find()
-    raw_df = pd.DataFrame(list(cursor))
+    input_collection  = db["karachi_aqi_dataset"]
+    output_collection = db["processed_features"]
+
+    # Ensure indexes exist for fast range queries on both collections
+    input_collection.create_index("datetime", background=True)
+    output_collection.create_index("datetime", unique=True, background=True)
+
+    # ── Determine the incremental window ──────────────────────────────────────
+    latest_processed = _get_latest_processed_datetime(output_collection)
+
+    if latest_processed is None:
+        # First-ever run: process everything (full historical backfill)
+        print(" -> No existing processed features found. Running full historical build...")
+        cursor = input_collection.find({}, {"_id": 0})
+        raw_df = pd.DataFrame(list(cursor))
+        new_rows_cutoff = None  # will upsert all rows
+    else:
+        # Incremental run:
+        # Load (latest_processed - _MAX_LOOKBACK_HOURS) onward so that every
+        # rolling/lag window that touches the new rows has full context.
+        context_start = latest_processed - pd.Timedelta(hours=_MAX_LOOKBACK_HOURS)
+        context_start_str = context_start.strftime("%Y-%m-%d %H:%M:%S")
+        print(f" -> Latest processed row: {latest_processed}.")
+        print(f" -> Loading context window from {context_start_str} ({_MAX_LOOKBACK_HOURS}h lookback)...")
+
+        cursor = input_collection.find(
+            {"datetime": {"$gte": context_start_str}},
+            {"_id": 0},
+        )
+        raw_df = pd.DataFrame(list(cursor))
+        new_rows_cutoff = latest_processed  # only upsert rows strictly after this
 
     if raw_df.empty:
         client.close()
-        raise RuntimeError("CRITICAL: 'karachi_aqi_dataset' collection is empty. Run build_dataset.py first.")
+        print(" -> No new data in karachi_aqi_dataset. Feature store is up to date.")
+        return
 
     if "_id" in raw_df.columns:
         raw_df = raw_df.drop(columns=["_id"])
 
     raw_df["datetime"] = pd.to_datetime(raw_df["datetime"])
+
+    # ── Build features over the loaded slice ──────────────────────────────────
+    # build_features() computes rolling stats correctly because the context
+    # rows (the _MAX_LOOKBACK_HOURS prefix) warm up every window before the
+    # new rows arrive.
     processed_df = build_features(raw_df)
+
+    # ── Filter to only the genuinely new rows before upserting ────────────────
+    if new_rows_cutoff is not None:
+        new_mask = processed_df["datetime"] > new_rows_cutoff
+        n_context = (~new_mask).sum()
+        processed_df = processed_df[new_mask].reset_index(drop=True)
+        print(f" -> Context rows used for window warm-up: {n_context:,} (not re-upserted).")
+        print(f" -> New rows to upsert: {len(processed_df):,}.")
+
+    if processed_df.empty:
+        client.close()
+        print(" -> Feature store already up to date. Nothing to upsert.")
+        return
 
     print("\n" + "=" * 70)
     print(" STREAMING STRUCTURED BATCH TO MONGODB FEATURE STORE")
@@ -531,7 +596,6 @@ def process_all():
     features_payload = mongo_df.to_dict(orient="records")
     print(f"Prepared {len(features_payload):,} documents for Atlas integration.")
 
-    output_collection = db["processed_features"]
     operations = [
         UpdateOne({"datetime": r["datetime"]}, {"$set": r}, upsert=True)
         for r in features_payload
