@@ -196,6 +196,69 @@ def load_xy(horizon: int, use_log: bool = True) -> tuple[pd.DataFrame, pd.Series
     return X, y
 
 
+def load_xy_both(horizon: int) -> tuple:
+    """
+    Single-fetch variant: returns (X, y_log, y_raw) in ONE MongoDB round-trip.
+    Use this instead of calling load_xy() twice — eliminates the doubled
+    network fetch that was causing the pipeline to hang on GitHub Actions.
+    """
+    assert horizon in (12, 24, 48, 72), "Horizon must be 12, 24, 48, or 72."
+
+    df = _fetch_from_feature_store()
+    print(f"Extracted feature store dataset matrix shape: {df.shape}")
+
+    raw_target_col = f"target_aqi_{horizon}h"
+    log_target_col = f"target_aqi_{horizon}h_log"
+
+    if raw_target_col not in df.columns:
+        raise ValueError(f"Target column not found: '{raw_target_col}'")
+
+    df = df.dropna(subset=[raw_target_col]).reset_index(drop=True)
+
+    if log_target_col not in df.columns:
+        df[log_target_col] = np.log1p(df[raw_target_col])
+
+    y_log = df[log_target_col].copy()
+    y_raw = df[raw_target_col].copy()
+
+    X = df.drop(columns=[c for c in BASE_DROP if c in df.columns], errors="ignore")
+    X = X.select_dtypes(include=[np.number])
+    X = X.replace([np.inf, -np.inf], np.nan)
+
+    missing_frac = X.isna().mean()
+    high_missing = missing_frac[missing_frac > 0.20].index.tolist()
+    if high_missing:
+        print(f"Dropping {len(high_missing)} features exceeding 20% NaN threshold: {high_missing}")
+        X = X.drop(columns=high_missing)
+
+    leaky = [c for c in X.columns if c in LEAKAGE_EXACT]
+    if leaky:
+        raise ValueError(
+            f"CRITICAL Data leakage detected. Forbidden columns still present in X:\n  {leaky}"
+        )
+
+    residual_nan = X.isna().mean()
+    nan_cols = residual_nan[residual_nan > 0].sort_values(ascending=False)
+    if not nan_cols.empty:
+        print(f"\nResidual NaN rates in feature matrix:")
+        print(nan_cols.round(4).to_string())
+
+    print(f"\nTarget Distributions (raw AQI {horizon}h):")
+    print(y_raw.describe().round(1).to_string())
+    print(f"\nModel feature dimension space: {X.shape[1]}")
+    print(f"Total row entries partitioned: {X.shape[0]:,}")
+
+    if "aqi_lag_1" in X.columns:
+        lag1_corr = X["aqi_lag_1"].corr(y_raw)
+        flag = (
+            "  <<< WARNING: SUSPICIOUSLY HIGH — CHECK FOR RESIDUAL LEAKAGE"
+            if lag1_corr > 0.99 else ""
+        )
+        print(f"aqi_lag_1 correlation -> Target ({horizon}h): {lag1_corr:.3f}{flag}")
+
+    return X, y_log, y_raw
+
+
 def get_chronological_splits(X: pd.DataFrame, y: pd.Series, horizon: int):
     """
     Chronological 70/10/20 split with causal gap buffers on BOTH boundaries.

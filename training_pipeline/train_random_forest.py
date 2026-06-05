@@ -41,7 +41,7 @@ from sklearn.metrics import (
 from sklearn.model_selection import TimeSeriesSplit, RandomizedSearchCV
 
 from load_data import (
-    load_xy,
+    load_xy_both,
     get_chronological_splits,
     get_spike_augmented_train,
     apply_leakage_free_correlation_filter,
@@ -108,8 +108,9 @@ def train_rf(horizon: int) -> dict:
     print(f"\n{'=' * 75}\n Random Forest — {horizon}h Horizon\n{'=' * 75}")
 
     # ── 1. Load ───────────────────────────────────────────────────────────────
-    X, y_log = load_xy(horizon, use_log=True)
-    _, y_raw  = load_xy(horizon, use_log=False)
+    # FIX: Single MongoDB fetch — load_xy_both() returns X, y_log, y_raw in
+    # one round-trip instead of the previous two calls that doubled network I/O.
+    X, y_log, y_raw = load_xy_both(horizon)
 
     X_train, y_train_log, X_cal, y_cal_log, X_test, y_test_log = \
         get_chronological_splits(X, y_log, horizon)
@@ -137,7 +138,7 @@ def train_rf(horizon: int) -> dict:
         # FIX 2: Replaced 0.15 (too low) with "sqrt" and 0.5
         "max_features":      ["sqrt", 0.2, 0.3, 0.5],
     }
-    base_rf   = RandomForestRegressor(random_state=42, n_jobs=-1)
+    base_rf   = RandomForestRegressor(random_state=42, n_jobs=1)  # FIX: n_jobs=1 here; parallelism lives in RandomizedSearchCV below
     tuning_cv = TimeSeriesSplit(n_splits=3, gap=horizon)
 
     # Weights for the search (on original X_train, not augmented)
@@ -151,7 +152,7 @@ def train_rf(horizon: int) -> dict:
         cv=tuning_cv,
         scoring="neg_root_mean_squared_error",
         random_state=42,
-        n_jobs=-1,
+        n_jobs=-1,  # outer parallelism: each of the 15 candidates runs in its own process
         verbose=1,
     )
     print("Running hyperparameter search on original (non-augmented) train set...")

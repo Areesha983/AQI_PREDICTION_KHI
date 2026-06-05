@@ -45,7 +45,7 @@ import xgboost as xgb
 import shap
 
 from load_data import (
-    load_xy,
+    load_xy_both,
     get_chronological_splits,
     get_spike_augmented_train,
     apply_leakage_free_correlation_filter,
@@ -110,8 +110,9 @@ def train_xgboost(horizon: int) -> dict:
     print(f"\n{'=' * 75}\n XGBoost Engine — {horizon}h Horizon\n{'=' * 75}")
 
     # ── 1. Load ───────────────────────────────────────────────────────────────
-    X, y_log  = load_xy(horizon, use_log=True)
-    _, y_raw  = load_xy(horizon, use_log=False)
+    # FIX: Single MongoDB fetch — load_xy_both() returns X, y_log, y_raw in
+    # one round-trip instead of the previous two calls that doubled network I/O.
+    X, y_log, y_raw = load_xy_both(horizon)
 
     X_train, y_train_log, X_cal, y_cal_log, X_test, y_test_log = \
         get_chronological_splits(X, y_log, horizon)
