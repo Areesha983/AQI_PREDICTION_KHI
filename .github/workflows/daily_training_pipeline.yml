@@ -2,9 +2,9 @@ name: Daily Model Training Pipeline
 
 on:
   schedule:
-    # Runs once a day at midnight UTC (05:00 AM Karachi Time)
+    # Wrapped cleanly in single quotes to prevent YAML parsing exceptions
     - cron: '0 0 * * *'
-  # Re-enables the manual execution drop-down menu in GitHub Actions
+  # Re-enables the manual "Run workflow" drop-down trigger button in your GitHub dashboard
   workflow_dispatch:
 
 env:
@@ -15,6 +15,7 @@ env:
 jobs:
   retrain-models:
     runs-on: ubuntu-latest
+    # Fail-safe timeout prevents the job from getting trapped in an infinite network hang
     timeout-minutes: 15
     
     steps:
