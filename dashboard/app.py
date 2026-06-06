@@ -1,31 +1,18 @@
 """
-AirLyst Karachi — AQI Intelligence Dashboard  (v4)
+AirLyst Karachi — AQI Intelligence Dashboard  (v5)
 Streamlit frontend consuming a Flask prediction microservice on Render.
 
-KEY FIXES in this version
-─────────────────────────
-FIX-502   Render free tier cold-starts take 20-60 s.  Every API call now
-          goes through _api_get() / _api_post() which:
-            1. Sends a non-blocking /health ping first.
-            2. Retries up to 3 times with exponential back-off (2 s, 4 s, 8 s).
-            3. Raises a clear, user-facing banner instead of per-section 502 spam.
+CHANGES vs v4
+─────────────
+FIX-SLIDER  Sidebar "Input Vectors" no longer renders interactive sliders.
+            Values are pulled from MongoDB (via /latest_features) and displayed
+            as read-only styled cards.  The inference payload is built from
+            those same live values so predictions are unchanged.
 
-FIX-UI-1  Added Section 4: SHAP Feature Importance (top-10 bar chart pulled
-          from /debug/shap endpoint, or model_shap collection).
-
-FIX-UI-2  Added Section 5: Stratified Error Bands — MAE by AQI tier.
-
-FIX-UI-3  Added Section 6: Skill Score & Conformal Coverage table.
-
-FIX-UI-4  Metrics table now shows MAE + MAPE alongside R² / RMSE / Coverage
-          so the dashboard is self-contained for an academic evaluation.
-
-FIX-UI-5  Cold-start spinner with elapsed timer shown while Render wakes up.
-
-STRUCTURE UNCHANGED
-  dashboard/app.py          ← this file
-  dashboard/alerts.py
-  dashboard/visualizations.py
+FIX-SHAP    The /shap/<model>/<horizon> endpoint already exists in api/app.py
+            (added in that file's latest revision).  This file needed no change
+            on the fetch side; the info-box and code-snippet fallback remain as
+            a graceful degradation if the collection is still empty.
 """
 
 import time
@@ -33,7 +20,6 @@ import streamlit as st
 import pandas as pd
 import requests
 import plotly.graph_objects as go
-import plotly.express as px
 
 from alerts import get_epa_tier_details
 from visualizations import plot_error_progression, plot_variance_matrix, plot_aqi_gauge
@@ -123,7 +109,6 @@ div[data-testid="stMetricLabel"] {
 h1, h2, h3 { font-family: var(--font-display) !important; color: var(--text-primary) !important; }
 .stMarkdown h3 { font-size: 1rem !important; font-weight: 600 !important; }
 
-[data-testid="stSlider"] > div > div > div { background: var(--accent) !important; }
 .js-plotly-plot .plotly { background: transparent !important; }
 
 hr { border-color: var(--border) !important; margin: 2rem 0 !important; }
@@ -158,18 +143,33 @@ section[data-testid="stSidebarCollapsedControl"] { visibility: visible !importan
     margin-bottom: 0.25rem;
 }
 
-/* Skill bar */
-.skill-bar-wrap { margin-bottom: 6px; }
-.skill-bar-label {
-    display: flex; justify-content: space-between;
-    font-size: 0.72rem; font-family: var(--font-mono);
-    color: #94a3b8; margin-bottom: 3px;
+/* Read-only sensor card */
+.sensor-card {
+    background: rgba(255,255,255,0.03);
+    border: 1px solid rgba(255,255,255,0.07);
+    border-radius: 10px;
+    padding: 10px 14px;
+    margin-bottom: 6px;
 }
-.skill-bar-bg {
-    background: rgba(255,255,255,0.05);
-    border-radius: 4px; height: 6px; overflow: hidden;
+.sensor-label {
+    font-size: 0.65rem;
+    color: #475569;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    font-family: 'JetBrains Mono', monospace;
 }
-.skill-bar-fill { height: 6px; border-radius: 4px; }
+.sensor-value {
+    font-size: 1.15rem;
+    font-weight: 700;
+    color: #f1f5f9;
+    font-family: 'JetBrains Mono', monospace;
+    margin-top: 2px;
+}
+.sensor-unit {
+    font-size: 0.7rem;
+    color: #64748b;
+    margin-left: 3px;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -181,26 +181,20 @@ section[data-testid="stSidebarCollapsedControl"] { visibility: visible !importan
 _MAX_RETRIES  = 3
 _BACKOFF_BASE = 2   # seconds; doubles each retry
 
+
 def _warm_up_render(gateway: str) -> bool:
-    """
-    Ping /health with generous timeout.  If Render returns 502 (sleeping),
-    wait and retry.  Returns True once the service is live, False if it
-    never woke within budget.
-    """
     for attempt in range(_MAX_RETRIES):
         try:
             r = requests.get(f"{gateway}/health", timeout=(10, 30))
             if r.status_code == 200:
                 return True
-            # 502 / 503 → service waking; wait then retry
         except requests.exceptions.Timeout:
             pass
         except requests.exceptions.ConnectionError:
-            return False   # DNS / network unreachable — no point retrying
+            return False
         except Exception:
             pass
-        wait = _BACKOFF_BASE ** attempt
-        time.sleep(wait)
+        time.sleep(_BACKOFF_BASE ** attempt)
     return False
 
 
@@ -298,24 +292,46 @@ with st.sidebar:
     active_model_key = model_mapping[selected_model_ui]
 
     st.markdown("---")
-    st.markdown("##### 🎯 Input Vectors")
 
+    # ── Fetch live features from MongoDB (via Flask) ──────────────────────────
     _fetched, mongo_active, mongo_error = _load_mongo_features(api_gateway)
     mongo_features.update(_fetched)
 
-    sim_pm25     = st.slider("PM2.5 (μg/m³)",    10.0, 350.0, _d("pm25",        "pm25_lag_1",        75.0), 5.0)
-    sim_pm10     = st.slider("PM10 (μg/m³)",      20.0, 500.0, _d("pm10",        "pm10_lag_1",       140.0), 5.0)
-    sim_temp     = st.slider("Temperature (°C)",  10.0,  48.0, _d("temperature", "temperature_lag_1",  32.0), 1.0)
-    sim_humidity = st.slider("Humidity (%)",       10.0, 100.0, _d("humidity",    "humidity_lag_1",     65.0), 5.0)
-    sim_wind     = st.slider("Wind Speed (km/h)",   0.0,  45.0, _d("wind_speed",  "wind_speed_lag_1",   12.0), 1.0)
+    # ── Resolve current sensor values (live or defaults) ─────────────────────
+    sim_pm25     = _d("pm25",        "pm25_lag_1",        75.0)
+    sim_pm10     = _d("pm10",        "pm10_lag_1",       140.0)
+    sim_temp     = _d("temperature", "temperature_lag_1",  32.0)
+    sim_humidity = _d("humidity",    "humidity_lag_1",     65.0)
+    sim_wind     = _d("wind_speed",  "wind_speed_lag_1",   12.0)
+
+    # ── Read-only sensor display ──────────────────────────────────────────────
+    st.markdown("##### 📡 Current Conditions")
+    st.caption("Live values from MongoDB feature store · read-only")
+
+    _sensor_rows = [
+        ("PM2.5",       sim_pm25,     "μg/m³"),
+        ("PM10",        sim_pm10,     "μg/m³"),
+        ("Temperature", sim_temp,     "°C"),
+        ("Humidity",    sim_humidity, "%"),
+        ("Wind Speed",  sim_wind,     "km/h"),
+    ]
+    for _label, _val, _unit in _sensor_rows:
+        st.markdown(
+            f"""<div class="sensor-card">
+                    <div class="sensor-label">{_label}</div>
+                    <div class="sensor-value">{_val:.1f}<span class="sensor-unit">{_unit}</span></div>
+                </div>""",
+            unsafe_allow_html=True,
+        )
 
     st.markdown("---")
     db_dot = "🟢" if mongo_active else "🔴"
-    st.markdown(f"""
-        <div style='font-size:0.72rem; color:#475569;'>
-            {db_dot} {'Live feature store' if mongo_active else 'Fallback defaults'}
-        </div>
-    """, unsafe_allow_html=True)
+    st.markdown(
+        f"""<div style='font-size:0.72rem; color:#475569;'>
+                {db_dot} {'Live feature store' if mongo_active else 'Fallback defaults'}
+            </div>""",
+        unsafe_allow_html=True,
+    )
     if not mongo_active and mongo_error:
         st.caption(f"⚠️ {mongo_error}")
 
@@ -367,7 +383,6 @@ def _fetch_prediction(model_key: str, horizon: int) -> dict | None:
         return None
     if r.status_code == 200:
         return r.json()
-    # Silent — error shown at section level, not per-card
     return None
 
 
@@ -534,7 +549,6 @@ _LAYOUT = dict(
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def _fetch_all_metrics(gateway: str) -> tuple[dict, str | None]:
-    """Returns (raw payload dict, error_message)."""
     if not _flask_reachable:
         return {}, "Flask API is offline."
     r = _api_get(gateway, "/metrics/all", timeout=(15, 60))
@@ -599,7 +613,6 @@ elif _metrics_err:
     st.warning(f"Some metric horizons missing from MongoDB:\n\n{_metrics_err}")
 
 if not metrics_df.empty:
-    # ── Row 1: RMSE progression + R² bar chart ─────────────────────────────
     chart_col1, chart_col2 = st.columns(2, gap="large")
     with chart_col1:
         st.plotly_chart(
@@ -614,7 +627,6 @@ if not metrics_df.empty:
             config={"displayModeBar": False},
         )
 
-    # ── Row 2: MAE + MAPE side-by-side ─────────────────────────────────────
     mae_col, mape_col = st.columns(2, gap="large")
 
     with mae_col:
@@ -671,7 +683,6 @@ if not metrics_df.empty:
                                title=dict(text="MAPE (%)", font=dict(color=_TEXT_COLOR, size=11)))
         st.plotly_chart(fig_mape, use_container_width=True, config={"displayModeBar": False})
 
-    # ── Row 3: Full metrics table ───────────────────────────────────────────
     st.markdown("#### 📋 Full Metrics Table")
     display_df = metrics_df.copy()
     display_df["R² Score"]  = display_df["R² Score"].map(lambda x: f"{x:.3f}")
@@ -694,14 +705,9 @@ st.caption("Top-10 features by mean |SHAP| value — computed on the held-out te
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def _fetch_shap(gateway: str, model_key: str, horizon: int) -> list[dict]:
-    """
-    Calls a debug endpoint that proxies model_shap collection.
-    Falls back to /debug/artifacts feature_names if SHAP not available.
-    """
     if not _flask_reachable:
         return []
-    path = f"/shap/{model_key}/{horizon}"
-    r = _api_get(gateway, path, timeout=(10, 30))
+    r = _api_get(gateway, f"/shap/{model_key}/{horizon}", timeout=(10, 30))
     if r and r.status_code == 200:
         try:
             return r.json().get("records", [])[:10]
@@ -710,15 +716,17 @@ def _fetch_shap(gateway: str, model_key: str, horizon: int) -> list[dict]:
     return []
 
 
-shap_horizon = st.selectbox("Horizon", [24, 48, 72], key="shap_horizon_sel",
-                             format_func=lambda h: f"{h}h")
+shap_horizon = st.selectbox(
+    "Horizon", [24, 48, 72],
+    key="shap_horizon_sel",
+    format_func=lambda h: f"{h}h",
+)
 
 shap_data = _fetch_shap(api_gateway, active_model_key, shap_horizon)
 
 if shap_data:
-    features = [d["feature"]        for d in shap_data]
-    values   = [d["mean_abs_shap"]  for d in shap_data]
-    max_v    = max(values) if values else 1.0
+    features = [d["feature"]       for d in shap_data]
+    values   = [d["mean_abs_shap"] for d in shap_data]
 
     fig_shap = go.Figure(go.Bar(
         x=values[::-1], y=features[::-1],
@@ -744,29 +752,12 @@ if shap_data:
                            tickfont=dict(color="#cbd5e1", size=10))
     st.plotly_chart(fig_shap, use_container_width=True, config={"displayModeBar": False})
 else:
-    # Graceful degradation: show skill-score-sorted feature list from metrics if SHAP endpoint missing
+    # Graceful degradation — shown only when model_shap collection is still empty
     st.info(
-        "SHAP data not yet available via API.  "
-        "Add a `/shap/<model>/<horizon>` route to `app.py` (Flask) that reads from the "
-        "`model_shap` MongoDB collection (already written by `save_shap()` during training).  "
-        "Once added, this chart will auto-populate."
+        "SHAP data not yet available.  The `/shap/<model>/<horizon>` route already exists "
+        "in `api/app.py`.  Once the training pipeline runs and writes to `model_shap` in "
+        "MongoDB, this chart will populate automatically on the next refresh."
     )
-    st.markdown("""
-    ```python
-    # Add to api/app.py (Flask)
-    @app.route("/shap/<string:model_type>/<int:horizon>", methods=["GET"])
-    def get_shap(model_type, horizon):
-        store_name = _API_TO_STORE_NAME.get(model_type.lower())
-        if not store_name:
-            return jsonify({"error": "unknown model"}), 400
-        from mongo_store import get_db
-        db  = get_db()
-        doc = db["model_shap"].find_one({"model": store_name, "horizon_h": horizon}, {"_id": 0})
-        if not doc:
-            return jsonify({"records": []}), 200
-        return jsonify({"records": doc.get("records", [])[:10]}), 200
-    ```
-    """)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -782,9 +773,6 @@ st.caption(
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def _fetch_skill_data(gateway: str) -> list[dict]:
-    """Reads model_metrics docs (one per model+horizon) for skill & coverage fields."""
-    if not _flask_reachable:
-        return []
     rows = []
     for api_key, display_name in _model_name_map.items():
         model_data = _raw_metrics.get(api_key, {})
@@ -802,12 +790,12 @@ def _fetch_skill_data(gateway: str) -> list[dict]:
             })
     return rows
 
+
 skill_rows = _fetch_skill_data(api_gateway)
 
 if skill_rows:
     skill_df = pd.DataFrame(skill_rows)
 
-    # Coverage heatmap (models × horizons)
     cov_col, margin_col = st.columns(2, gap="large")
 
     with cov_col:
@@ -838,7 +826,6 @@ if skill_rows:
         st.plotly_chart(fig_cov, use_container_width=True, config={"displayModeBar": False})
 
     with margin_col:
-        # Conformal margin (prediction interval half-width) — lower is better
         fig_margin = go.Figure()
         for model, color in _MODEL_COLORS.items():
             df_m = skill_df[skill_df["Model"] == model]
@@ -868,7 +855,7 @@ else:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  SECTION 6 — STRATIFIED BAND ERRORS (already in model_metrics but needs endpoint)
+#  SECTION 6 — STRATIFIED BAND ERRORS
 # ═══════════════════════════════════════════════════════════════════════════════
 st.markdown("<hr>", unsafe_allow_html=True)
 st.markdown("### 🏷️ Error by AQI Tier")
@@ -880,10 +867,6 @@ st.caption(
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def _fetch_band_errors(gateway: str) -> pd.DataFrame:
-    """
-    Pulls per-band MAE from /debug/metrics_raw and parses error_by_band field.
-    Falls back gracefully if not present.
-    """
     if not _flask_reachable:
         return pd.DataFrame()
     r = _api_get(gateway, "/debug/metrics_raw", timeout=(10, 30))
@@ -892,17 +875,17 @@ def _fetch_band_errors(gateway: str) -> pd.DataFrame:
 
     BAND_LABELS = {
         "good_moderate":       "Good–Moderate (0–100)",
-        "unhealthy_sensitive":  "USG (101–150)",
-        "unhealthy":            "Unhealthy (151–200)",
-        "very_unhealthy":       "Very Unhealthy (201–300)",
-        "hazardous":            "Hazardous (301+)",
+        "unhealthy_sensitive": "USG (101–150)",
+        "unhealthy":           "Unhealthy (151–200)",
+        "very_unhealthy":      "Very Unhealthy (201–300)",
+        "hazardous":           "Hazardous (301+)",
     }
     BAND_COLORS = {
-        "Good–Moderate (0–100)":      "#00e676",
-        "USG (101–150)":              "#ff9100",
-        "Unhealthy (151–200)":        "#ff1744",
-        "Very Unhealthy (201–300)":   "#d500f9",
-        "Hazardous (301+)":           "#b71c1c",
+        "Good–Moderate (0–100)":    "#00e676",
+        "USG (101–150)":            "#ff9100",
+        "Unhealthy (151–200)":      "#ff1744",
+        "Very Unhealthy (201–300)": "#d500f9",
+        "Hazardous (301+)":         "#b71c1c",
     }
 
     try:
@@ -935,7 +918,6 @@ def _fetch_band_errors(gateway: str) -> pd.DataFrame:
 band_df = _fetch_band_errors(api_gateway)
 
 if not band_df.empty:
-    # One chart per horizon, showing all models × bands
     band_horizons = [f"{h}h" for h in [24, 48, 72]]
     b_cols = st.columns(3, gap="medium")
     for ci, bh in enumerate(band_horizons):
@@ -963,7 +945,6 @@ if not band_df.empty:
                     hovertemplate="<b>%{x}</b><br>MAE: %{y:.1f}  n=%{customdata}<extra>" + model + "</extra>",
                     customdata=df_bm["N"],
                 ))
-
             fig_b.update_layout(
                 **_LAYOUT, barmode="group", bargap=0.2, height=340,
                 title=dict(text=f"Band MAE — {bh}", x=0.01,
