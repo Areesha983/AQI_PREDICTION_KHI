@@ -68,32 +68,32 @@ def _run_id() -> str:
 
 def _gridfs_upsert(filename: str, data: bytes, metadata: dict) -> str:
     """
-    Store binary data in GridFS under `filename`.
-
-    Retention policy: keep only the latest 2 versions per (model, horizon_h)
-    to prevent Atlas Free Tier storage from growing unboundedly across daily
-    retraining runs.  Older files are deleted before the new one is written.
-    Returns the new file _id as a string.
+    Store binary data in GridFS and ensure old chunks are properly removed.
     """
     fs = _get_fs()
 
+    # Query for existing files matching the model and horizon
     query = {
         "metadata.model":     metadata.get("model"),
         "metadata.horizon_h": metadata.get("horizon_h"),
     }
 
+    # Find existing files, sorted by upload date (newest first)
     existing_files = list(fs.find(query).sort("uploadDate", -1))
 
-    KEEP_N = 1  # Keep only the single latest version to minimise M0 storage usage
+    # Retention: Keep only the latest 1 version
+    KEEP_N = 1 
 
     if len(existing_files) >= KEEP_N:
+        # Delete from the index KEEP_N-1 onwards to keep only the newest
         for old_file in existing_files[KEEP_N - 1:]:
             try:
-                print(f"  [mongo_store] 🗑  Pruning stale artifact: {old_file._id}")
-                fs.delete(old_file._id)
+                print(f"  [mongo_store] 🗑  Deleting orphaned GridFS chunks for: {old_file.filename}")
+                fs.delete(old_file._id) # This correctly deletes both files and chunks
             except Exception as e:
-                print(f"  [mongo_store] ⚠️  Failed to delete artifact {old_file._id}: {e}")
+                print(f"  [mongo_store] ⚠️  Failed to delete GridFS artifact {old_file._id}: {e}")
 
+    # Write the new file
     file_id = fs.put(data, filename=filename, metadata=metadata)
     return str(file_id)
 
