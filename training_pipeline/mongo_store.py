@@ -68,33 +68,34 @@ def _run_id() -> str:
 
 def _gridfs_upsert(filename: str, data: bytes, metadata: dict) -> str:
     """
-    Store binary data in GridFS and ensure old chunks are properly removed.
+    Store binary data in GridFS, then delete any older versions.
+
+    FIX: Previously deleted BEFORE writing, which meant the current file was
+    deleted when KEEP_N=1 and one version already existed. Now we write first,
+    then prune anything older than the file we just wrote.
     """
     fs = _get_fs()
 
-    # Query for existing files matching the model and horizon
+    # 1. Write the new file first — always succeeds before any deletion
+    file_id = fs.put(data, filename=filename, metadata=metadata)
+
+    # 2. Now find all versions for this (model, horizon) — newest first
     query = {
         "metadata.model":     metadata.get("model"),
         "metadata.horizon_h": metadata.get("horizon_h"),
     }
-
-    # Find existing files, sorted by upload date (newest first)
     existing_files = list(fs.find(query).sort("uploadDate", -1))
 
-    # Retention: Keep only the latest 1 version
-    KEEP_N = 1 
+    # 3. Keep only the newest 1; delete the rest (they are all older than
+    #    the file we just wrote since GridFS appends by upload date)
+    KEEP_N = 1
+    for old_file in existing_files[KEEP_N:]:
+        try:
+            print(f"  [mongo_store] 🗑  Pruning old GridFS version: {old_file.filename} ({old_file._id})")
+            fs.delete(old_file._id)
+        except Exception as e:
+            print(f"  [mongo_store] ⚠️  Failed to delete GridFS artifact {old_file._id}: {e}")
 
-    if len(existing_files) >= KEEP_N:
-        # Delete from the index KEEP_N-1 onwards to keep only the newest
-        for old_file in existing_files[KEEP_N - 1:]:
-            try:
-                print(f"  [mongo_store] 🗑  Deleting orphaned GridFS chunks for: {old_file.filename}")
-                fs.delete(old_file._id) # This correctly deletes both files and chunks
-            except Exception as e:
-                print(f"  [mongo_store] ⚠️  Failed to delete GridFS artifact {old_file._id}: {e}")
-
-    # Write the new file
-    file_id = fs.put(data, filename=filename, metadata=metadata)
     return str(file_id)
 
 

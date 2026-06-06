@@ -2,40 +2,44 @@
 Enterprise MLOps Prediction API Service Layer.
 Exposes real-time endpoints for Multi-Model 24h, 48h, and 72h AQI forecasting.
 
-CHANGES vs previous version:
-  MONGO FIX — load_prediction_artifacts() was reading from local .pkl files
-    (MODELS_DIR / f"{model_type}_{horizon}h.pkl"). All model artifacts are now
-    stored in MongoDB Atlas (model_artifacts collection) by the training scripts
-    via mongo_store.save_model_artifact(). This version uses
-    mongo_store.load_model_artifact() exclusively; no local filesystem reads.
+KEY FIXES IN THIS VERSION
+──────────────────────────
+FIX 1 — METRICS PATH SIMPLIFIED
+  _get_latest_metrics_doc() now always returns None, forcing _metrics_from_mongo()
+  to use the robust per-doc fallback (Shape D) that directly queries model_metrics
+  by {model, horizon_h}. The "primary path" was schema-mismatched and unreliable.
 
-  The artifact dict stored in MongoDB has this shape (written by every trainer):
-    {
-      "model":            <fitted estimator>,
-      "feature_names":    [...],
-      "conformal_margin": float,
-      "use_log":          bool,
-      ...trainer-specific keys...
-    }
-  This is identical to what the old joblib.load() returned, so no other
-  call-site changes were needed.
+FIX 2 — MODEL-AWARE FEATURE VECTOR (_build_feature_vector)
+  The function now accepts the full artifact dict instead of a bare feature-name
+  list.  For Ridge it reads 'use_interactions' + 'interaction_cols' from the
+  artifact and reconstructs every polynomial cross-term before inference,
+  matching exactly what train_ridge.py produced at training time.
 
-RENDER FIXES:
-  - Added flask-cors: CORS(app) so Streamlit frontend can call this API
-  - Removed duplicate home() route that conflicted with index()
-  - Set debug=False for production safety
+FIX 3 — PREDICT ROUTE WIRED TO FIXED BUILDER
+  /predict/<model_type>/<horizon> passes the full artifact dict to
+  _build_feature_vector() so Ridge gets its 210-column vector and RF/XGBoost
+  keep their 151-column vector, with zero-filling scoped per model.
 
-NEW:
-  - Added GET /shap/<model_type>/<horizon> — returns top-10 SHAP feature
-    importance records from the model_shap MongoDB collection.
+FIX 4 — NAMING CONSISTENCY
+  _API_TO_EVAL_NAME and _API_TO_STORE_NAME are unified into a single
+  _API_TO_MONGO_NAME mapping (the names are identical; two tables were redundant
+  and a potential source of drift).
+
+UNCHANGED
+  - MongoDB-only artifact loading (GridFS via mongo_store.load_model_artifact)
+  - CORS, debug=False, all existing routes (/health, /shap, /debug/*)
+  - 5-minute in-memory caches for features and metrics
 """
 
 import os
+import sys
 import time
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 
 from pathlib import Path
+from itertools import combinations
+
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 import numpy as np
@@ -44,7 +48,7 @@ from pymongo import MongoClient
 from pymongo.errors import PyMongoError
 from dotenv import load_dotenv
 
-# ── PATH & ENV SETUP ─────────────────────────────────────────────────────────
+# ── PATH & ENV SETUP ──────────────────────────────────────────────────────────
 API_DIR  = Path(__file__).resolve().parent
 BASE_DIR = API_DIR.parent
 
@@ -54,22 +58,21 @@ DB_NAME     = "karachi_aqi"
 FEAT_COL    = "processed_features"
 METRICS_COL = "model_metrics"
 
+# Ensure training_pipeline is importable (for mongo_store)
+_PIPELINE_DIR = BASE_DIR / "training_pipeline"
+if str(_PIPELINE_DIR) not in sys.path:
+    sys.path.insert(0, str(_PIPELINE_DIR))
+
 app = Flask(__name__)
 CORS(app)
 
-MODEL_CACHE    = {}
+# ── Constants ─────────────────────────────────────────────────────────────────
+MODEL_CACHE    : dict = {}
 VALID_MODELS   = ["random_forest", "xgboost", "ridge"]
 VALID_HORIZONS = {24, 48, 72}
 
-# Map API names → evaluate.py / mongo_store names
-_API_TO_EVAL_NAME = {
-    "random_forest": "RandomForest",
-    "xgboost":       "XGBoost",
-    "ridge":         "Ridge",
-}
-
-# Map API names → mongo_store model_name strings (as saved by train_*.py)
-_API_TO_STORE_NAME = {
+# Single authoritative name map: API slug → MongoDB model name
+_API_TO_MONGO_NAME: dict[str, str] = {
     "random_forest": "RandomForest",
     "xgboost":       "XGBoost",
     "ridge":         "Ridge",
@@ -84,7 +87,7 @@ _CACHE_TTL = 300
 _MONGO_MISS = "__MONGO_MISS__"
 
 # ── Metric key aliases ────────────────────────────────────────────────────────
-_METRIC_ALIASES = {
+_METRIC_ALIASES: dict[str, list[str]] = {
     "r2":       ["R2", "r2", "test_r2", "R²", "r2_score"],
     "rmse":     ["RMSE", "rmse", "test_rmse", "root_mean_squared_error"],
     "mae":      ["MAE", "mae", "test_mae", "mean_absolute_error"],
@@ -94,7 +97,8 @@ _METRIC_ALIASES = {
 }
 
 
-def _mongo_client():
+# ── Utility helpers ───────────────────────────────────────────────────────────
+def _mongo_client() -> MongoClient:
     if not MONGO_URI:
         raise ValueError("MONGODB_URI is not set in environment / .env")
     return MongoClient(MONGO_URI, serverSelectionTimeoutMS=10_000, socketTimeoutMS=120_000)
@@ -123,6 +127,7 @@ def _safe_float(val, default: float = 0.0) -> float:
 
 # ── Feature helpers ───────────────────────────────────────────────────────────
 def _get_latest_feature_doc() -> dict | None:
+    """Fetches the most-recent processed_features document (5-min cached)."""
     now = time.time()
     if _FEATURE_CACHE["doc"] is not None and (now - _FEATURE_CACHE["ts"]) < _CACHE_TTL:
         return _FEATURE_CACHE["doc"]
@@ -147,23 +152,69 @@ def _get_latest_feature_doc() -> dict | None:
         return None
 
 
-def _build_feature_vector(expected_features: list, slider_overrides: dict) -> pd.DataFrame:
-    """Use latest MongoDB doc as base; overlay slider values on lag-1 features."""
+def _reconstruct_interaction_terms(
+    base: dict,
+    interaction_cols: list[str],
+) -> dict:
+    """
+    Reconstruct every pairwise cross-term that train_ridge._add_interaction_terms()
+    produced (PolynomialFeatures degree=2, interaction_only=True, include_bias=False).
+
+    Column naming matches sklearn's get_feature_names_out(): "colA colB"
+    (space-separated), which is what the Ridge artifact's feature_names list
+    contains for cross-terms.
+
+    Only terms whose BOTH base columns are present in `base` are added; the
+    rest are filled with 0.0 — the same behaviour as PolynomialFeatures when
+    the input contains NaN → 0.
+    """
+    extra: dict = {}
+    present = [c for c in interaction_cols if c in base]
+    for a, b in combinations(present, 2):
+        col_name = f"{a} {b}"
+        extra[col_name] = base.get(a, 0.0) * base.get(b, 0.0)
+    return extra
+
+
+def _build_feature_vector(artifact: dict, slider_overrides: dict) -> pd.DataFrame:
+    """
+    Build a model-specific inference DataFrame.
+
+    Steps
+    ─────
+    1. Load the most-recent processed_features doc as a base row.
+    2. Overlay AQI-derived slider values on the relevant lag-1 columns.
+    3. If the artifact uses Ridge-style interaction terms, reconstruct them
+       from the base values so Ridge gets its full 210-column vector.
+    4. Align to artifact['feature_names'], zero-filling any missing columns.
+    5. Return a single-row DataFrame ready for model.predict().
+
+    Parameters
+    ──────────
+    artifact        : full dict returned by mongo_store.load_model_artifact()
+    slider_overrides: dict from the POST body's 'features' key
+    """
+    expected_features  : list[str] = artifact["feature_names"]
+    use_interactions   : bool      = artifact.get("use_interactions", False)
+    interaction_cols   : list[str] = artifact.get("interaction_cols", [])
+
     latest_doc = _get_latest_feature_doc()
 
-    base = (
+    # Step 1 — seed base from latest MongoDB doc (all numeric fields)
+    base: dict = (
         {f: _safe_float(latest_doc.get(f), 0.0) for f in expected_features}
         if latest_doc
         else {f: 0.0 for f in expected_features}
     )
 
+    # Step 2 — compute AQI from PM2.5 and overlay slider values on lag-1 keys
     def _aqi_from_pm25(pm25: float) -> float:
         if np.isnan(pm25) or pm25 < 0:
             return float("nan")
         bps = [
-            (0.0,   12.0,  0,   50),  (12.1,  35.4,  51,  100),
-            (35.5,  55.4,  101, 150), (55.5,  150.4, 151, 200),
-            (150.5, 250.4, 201, 300), (250.5, 350.4, 301, 400),
+            (0.0,   12.0,  0,   50),   (12.1,  35.4,  51,  100),
+            (35.5,  55.4,  101, 150),  (55.5,  150.4, 151, 200),
+            (150.5, 250.4, 201, 300),  (250.5, 350.4, 301, 400),
             (350.5, 500.4, 401, 500),
         ]
         for c_lo, c_hi, a_lo, a_hi in bps:
@@ -171,8 +222,8 @@ def _build_feature_vector(expected_features: list, slider_overrides: dict) -> pd
                 return round(((a_hi - a_lo) / (c_hi - c_lo)) * (pm25 - c_lo) + a_lo)
         return 500.0
 
-    pm25 = _safe_float(slider_overrides.get("pm25",        base.get("pm25_lag_1")),  75.0)
-    pm10 = _safe_float(slider_overrides.get("pm10",        base.get("pm10_lag_1")), 140.0)
+    pm25 = _safe_float(slider_overrides.get("pm25",        base.get("pm25_lag_1")),   75.0)
+    pm10 = _safe_float(slider_overrides.get("pm10",        base.get("pm10_lag_1")),  140.0)
     temp = _safe_float(slider_overrides.get("temperature", base.get("temperature_lag_1")), 32.0)
     hum  = _safe_float(slider_overrides.get("humidity",    base.get("humidity_lag_1")),    65.0)
     wind = _safe_float(slider_overrides.get("wind_speed",  base.get("wind_speed_lag_1")),  10.0)
@@ -181,59 +232,68 @@ def _build_feature_vector(expected_features: list, slider_overrides: dict) -> pd
     if np.isnan(aqi_now):
         aqi_now = _safe_float(base.get("aqi_lag_1"), 75.0)
 
-    overrides = {
-        "aqi_lag_1":                     aqi_now,
-        "pm25_lag_1":                    pm25,
-        "pm10_lag_1":                    pm10,
-        "temperature_lag_1":             temp,
-        "humidity_lag_1":                hum,
-        "wind_speed_lag_1":              wind,
+    # Base overrides applied to every model
+    lag1_overrides: dict = {
+        "aqi_lag_1":         aqi_now,
+        "pm25_lag_1":        pm25,
+        "pm10_lag_1":        pm10,
+        "temperature_lag_1": temp,
+        "humidity_lag_1":    hum,
+        "wind_speed_lag_1":  wind,
+        # Derived features used by RF/XGBoost (present in their feature_names)
         "interaction_pm25_humidity":     pm25 * hum / 100.0,
         "interaction_pm25_wind_inverse": pm25 / (wind + 0.5),
         "temp_humidity":                 temp * hum,
-        "heat_dryness":                  temp / (hum + 1),
-        "wind_dispersal":                wind / (pm25 + 5),
+        "heat_dryness":                  temp / (hum + 1.0),
+        "wind_dispersal":                wind / (pm25 + 5.0),
         "temp_to_wind_ratio":            temp / (wind + 0.1),
         "humidity_to_wind_ratio":        hum  / (wind + 0.1),
     }
-    for k, v in overrides.items():
+    for k, v in lag1_overrides.items():
         if k in base:
             base[k] = v
 
-    df = pd.DataFrame([base])[expected_features]
+    # Step 3 — reconstruct Ridge polynomial cross-terms when required
+    if use_interactions and interaction_cols:
+        # Build a lookup with the CURRENT (post-override) values of all base
+        # columns so the cross-terms reflect the sliders, not stale DB values.
+        full_lookup = {**base, **lag1_overrides}   # lag1_overrides wins on overlap
+        cross_terms = _reconstruct_interaction_terms(full_lookup, interaction_cols)
+        base.update(cross_terms)
+
+    # Step 4 — align to model's exact feature list, zero-fill any gaps
+    row = {f: _safe_float(base.get(f), 0.0) for f in expected_features}
+
+    df = pd.DataFrame([row])[expected_features]
     df = df.replace([np.inf, -np.inf], np.nan).fillna(0.0)
     return df
 
 
-# ── Model artifact loader (MONGO-ONLY) ───────────────────────────────────────
+# ── Model artifact loader (MongoDB-only) ─────────────────────────────────────
 def load_prediction_artifacts(model_type: str, horizon: int) -> dict:
     """
-    Loads a trained model artifact from MongoDB (model_artifacts collection).
+    Loads a trained model artifact from MongoDB (GridFS via mongo_store).
 
-    Previously this read from local .pkl files on disk. All training scripts
-    now call mongo_store.save_model_artifact() instead of joblib.dump(), so
-    the local files no longer exist.  This function uses
-    mongo_store.load_model_artifact() and caches the result in MODEL_CACHE.
+    Returns the full artifact dict:
+        {
+          "model":            <fitted estimator>,
+          "feature_names":    [...],
+          "conformal_margin": float,
+          "use_log":          bool,
+          "use_interactions": bool,      # Ridge only
+          "interaction_cols": [...],     # Ridge only
+        }
 
-    The artifact dict returned has at minimum:
-      {
-        "model":            <fitted estimator>,
-        "feature_names":    [...],
-        "conformal_margin": float,
-        "use_log":          bool,
-      }
+    Results are cached in MODEL_CACHE for the lifetime of the process.
     """
     cache_key = f"{model_type}_{horizon}"
     if cache_key in MODEL_CACHE:
         return MODEL_CACHE[cache_key]
 
-    store_name = _API_TO_STORE_NAME.get(model_type)
+    store_name = _API_TO_MONGO_NAME.get(model_type)
     if not store_name:
         raise ValueError(f"Unknown model type: {model_type!r}")
 
-    # Import here to avoid circular dependency issues at module load time
-    import sys
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "training_pipeline"))
     from mongo_store import load_model_artifact
 
     artifact = load_model_artifact(model_name=store_name, horizon=horizon)
@@ -244,192 +304,75 @@ def load_prediction_artifacts(model_type: str, horizon: int) -> dict:
         )
 
     MODEL_CACHE[cache_key] = artifact
-    print(f"[model-cache] Loaded '{store_name}' {horizon}h from MongoDB ✓")
+    n_features = len(artifact.get("feature_names", []))
+    print(f"[model-cache] Loaded '{store_name}' {horizon}h from MongoDB ✓  ({n_features} features)")
     return artifact
 
 
 # ── Metrics helpers ───────────────────────────────────────────────────────────
 def _get_latest_metrics_doc() -> dict | None:
-    now    = time.time()
-    cached = _METRICS_CACHE["doc"]
-    if cached is not None and (now - _METRICS_CACHE["ts"]) < _CACHE_TTL:
-        return None if cached == _MONGO_MISS else cached
-    try:
-        client = _mongo_client()
-        db     = client[DB_NAME]
-        col    = db[METRICS_COL]
-
-        doc = col.find_one({"pipeline_run_status": "SUCCESS"}, sort=[("timestamp", -1)])
-        if doc is None:
-            doc = col.find_one({}, sort=[("timestamp", -1)])
-        if doc is None:
-            doc = col.find_one({})
-
-        client.close()
-
-        if doc is None:
-            print("[metrics-cache] WARNING: model_metrics collection is empty.")
-            _METRICS_CACHE["doc"] = _MONGO_MISS
-            _METRICS_CACHE["ts"]  = now
-            return None
-
-        doc.pop("_id", None)
-        print(f"[metrics-cache] Raw doc top-level keys: {list(doc.keys())}")
-
-        summary = _normalise_metrics_doc(doc)
-        if summary:
-            _METRICS_CACHE["doc"] = summary
-            _METRICS_CACHE["ts"]  = now
-            return summary
-
-        print(
-            "[metrics-cache] WARNING: could not extract performance_summary. "
-            f"Full top-level keys: {sorted(doc.keys())}"
-        )
-        _METRICS_CACHE["doc"] = _MONGO_MISS
-        _METRICS_CACHE["ts"]  = now
-        return None
-
-    except PyMongoError as e:
-        print(f"[metrics-cache] ERROR: MongoDB fetch failed — {e}")
-        _METRICS_CACHE["doc"] = _MONGO_MISS
-        _METRICS_CACHE["ts"]  = now
-        return None
-
-
-def _normalise_metrics_doc(doc: dict) -> dict | None:
     """
-    Handles all known shapes the model_metrics document might have.
+    FIX 1 — Always returns None.
 
-    Shape A (evaluate.py standard):
-      { performance_summary: { "24h": { models: { "RandomForest": {...} } } } }
+    The previous primary path attempted to fetch a single aggregate pipeline_runs
+    document and normalise it across multiple schema shapes (A/B/C). That path
+    was brittle: when evaluate.py had not run, or the document schema differed,
+    the whole metrics API returned zeros.
 
-    Shape B (flat per-horizon):
-      { "24h": { "RandomForest": {...} }, "48h": {...}, ... }
-
-    Shape C (flat with model prefix):
-      { "RandomForest_24h": {...}, "XGBoost_48h": {...}, ... }
-
-    Shape D (individual per-model-per-horizon flat docs from save_metrics):
-      Individual documents stored per model per horizon in model_metrics.
-      Handled separately by _metrics_from_mongo() via direct per-doc queries.
-
-    Returns normalised dict keyed by horizon string ("24h", "48h", "72h").
+    The robust fallback in _metrics_from_mongo() queries model_metrics directly
+    per (model, horizon_h) — exactly how save_metrics() writes them — and is
+    always correct.  Bypassing the primary path here forces that fallback to
+    run every time with zero schema-mismatch risk.
     """
-    horizons = ["24h", "48h", "72h"]
-    models   = ["RandomForest", "XGBoost", "Ridge"]
-
-    # Shape A
-    if "performance_summary" in doc:
-        ps = doc["performance_summary"]
-        if isinstance(ps, dict) and any(h in ps for h in horizons):
-            return ps
-
-    # Shape B
-    if any(h in doc for h in horizons):
-        result = {}
-        for h in horizons:
-            if h not in doc:
-                continue
-            h_block = doc[h]
-            if not isinstance(h_block, dict):
-                continue
-            result[h] = h_block if "models" in h_block else {"models": h_block}
-        if result:
-            return result
-
-    # Shape C
-    result: dict = {h: {"models": {}} for h in horizons}
-    found_any = False
-    for model in models:
-        for h in horizons:
-            for key in [f"{model}_{h}", f"{model.lower()}_{h}"]:
-                if key in doc and isinstance(doc[key], dict):
-                    result[h]["models"][model] = doc[key]
-                    found_any = True
-    if found_any:
-        return result
-
-    print(
-        f"[metrics-cache] _normalise_metrics_doc: no schema matched. "
-        f"Full keys: {sorted(doc.keys())}"
-    )
     return None
 
 
 def _metrics_from_mongo(model_type: str) -> dict:
     """
-    Primary path: tries the pipeline_runs-style summary doc (evaluate.py output).
-    Fallback path: queries model_metrics directly per model+horizon (save_metrics
-    output from train_*.py). This covers the common case where evaluate.py has
-    not run yet but individual training runs have already written their metrics.
+    Queries model_metrics directly for each (store_name, horizon) pair
+    (Shape D — individual docs written by save_metrics() in each trainer).
+
+    Falls back to an empty error dict if MongoDB is unreachable or empty
+    for a given horizon.
     """
-    eval_name     = _API_TO_EVAL_NAME.get(model_type, model_type.title())
-    store_name    = _API_TO_STORE_NAME.get(model_type, eval_name)
-    mongo_summary = _get_latest_metrics_doc()
-    report        = {}
+    store_name = _API_TO_MONGO_NAME.get(model_type)
+    if not store_name:
+        return {str(h): {"error": f"Unknown model type: {model_type!r}"} for h in sorted(VALID_HORIZONS)}
+
+    report: dict = {}
 
     for h in sorted(VALID_HORIZONS):
-        h_key    = f"{h}h"
-        mongo_ok = False
-
-        # ── Primary path: evaluate.py summary doc ────────────────────────────
-        if mongo_summary and h_key in mongo_summary:
-            horizon_block = mongo_summary[h_key]
-            models_block  = {}
-            if isinstance(horizon_block, dict):
-                models_block = (
-                    horizon_block["models"]
-                    if "models" in horizon_block and isinstance(horizon_block["models"], dict)
-                    else horizon_block
-                )
-            m = models_block.get(eval_name, {}) if isinstance(models_block, dict) else {}
-            if m and isinstance(m, dict):
-                report[str(h)] = {
-                    "r2":       _extract_metric(m, "r2"),
-                    "rmse":     _extract_metric(m, "rmse"),
-                    "mae":      _extract_metric(m, "mae"),
-                    "mape":     _extract_metric(m, "mape"),
-                    "coverage": _extract_metric(m, "coverage"),
-                    "margin":   _extract_metric(m, "margin"),
-                }
-                if report[str(h)]["r2"] != 0.0 or report[str(h)]["mae"] != 0.0:
-                    mongo_ok = True
-                    print(f"[metrics] {store_name}/{h_key} loaded from summary doc ✓")
-
-        # ── Fallback path: individual model_metrics documents ────────────────
-        if not mongo_ok:
-            try:
-                client = _mongo_client()
-                db     = client[DB_NAME]
-                col    = db[METRICS_COL]
-                m_doc  = col.find_one(
-                    {"model": store_name, "horizon_h": h},
-                    {"_id": 0},
-                )
-                client.close()
-
-                if m_doc:
-                    report[str(h)] = {
-                        "r2":       _extract_metric(m_doc, "r2"),
-                        "rmse":     _extract_metric(m_doc, "rmse"),
-                        "mae":      _extract_metric(m_doc, "mae"),
-                        "mape":     _extract_metric(m_doc, "mape"),
-                        "coverage": _extract_metric(m_doc, "coverage"),
-                        "margin":   _extract_metric(m_doc, "margin"),
-                    }
-                    mongo_ok = True
-                    print(f"[metrics] {store_name}/{h_key} loaded from model_metrics doc ✓")
-            except PyMongoError as e:
-                print(f"[metrics] {store_name}/{h_key} fallback query failed: {e}")
-
-        if not mongo_ok:
-            reason = (
-                f"No metrics found in MongoDB for model='{store_name}', horizon={h_key}. "
-                "Run the training script first."
+        h_key = f"{h}h"
+        try:
+            client = _mongo_client()
+            db     = client[DB_NAME]
+            m_doc  = db[METRICS_COL].find_one(
+                {"model": store_name, "horizon_h": h},
+                {"_id": 0},
             )
-            report[str(h)] = {"error": reason}
-            print(f"[metrics] {store_name}/{h_key} — MongoDB miss: {reason}")
+            client.close()
+
+            if m_doc:
+                report[str(h)] = {
+                    "r2":       _extract_metric(m_doc, "r2"),
+                    "rmse":     _extract_metric(m_doc, "rmse"),
+                    "mae":      _extract_metric(m_doc, "mae"),
+                    "mape":     _extract_metric(m_doc, "mape"),
+                    "coverage": _extract_metric(m_doc, "coverage"),
+                    "margin":   _extract_metric(m_doc, "margin"),
+                }
+                print(f"[metrics] {store_name}/{h_key} loaded from model_metrics ✓")
+            else:
+                reason = (
+                    f"No metrics found in MongoDB for model='{store_name}', horizon={h_key}. "
+                    "Run the training script first."
+                )
+                report[str(h)] = {"error": reason}
+                print(f"[metrics] {store_name}/{h_key} — MongoDB miss.")
+
+        except PyMongoError as e:
+            print(f"[metrics] {store_name}/{h_key} query failed: {e}")
+            report[str(h)] = {"error": f"MongoDB query failed: {e}"}
 
     return report
 
@@ -464,15 +407,13 @@ def index():
 
 @app.route("/health", methods=["GET"])
 def health_check():
-    mongo_summary = _get_latest_metrics_doc()
-    feat_doc      = _get_latest_feature_doc()
+    feat_doc = _get_latest_feature_doc()
     return jsonify({
         "status":                  "healthy",
         "service":                 "aqi-multi-model-forecasting-api",
         "storage_backend":         "MongoDB Atlas (no local files)",
         "warmed_models_in_cache":  list(MODEL_CACHE.keys()),
         "mongo_connected":         MONGO_URI is not None,
-        "metrics_in_mongo":        mongo_summary is not None,
         "features_in_mongo":       feat_doc is not None,
         "feature_doc_sample_keys": list(feat_doc.keys())[:8] if feat_doc else [],
     }), 200
@@ -504,14 +445,14 @@ def predict_aqi(model_type: str, horizon: int):
         return jsonify({"error": "Body must contain a 'features' key."}), 400
 
     try:
-        artifacts         = load_prediction_artifacts(model_type, horizon)
-        model             = artifacts["model"]
-        expected_features = artifacts["feature_names"]
-        conformal_margin  = artifacts["conformal_margin"]
-        use_log           = artifacts.get("use_log", False)
+        # FIX 2+3 — pass full artifact to model-aware builder
+        artifact         = load_prediction_artifacts(model_type, horizon)
+        model            = artifact["model"]
+        conformal_margin = artifact["conformal_margin"]
+        use_log          = artifact.get("use_log", False)
 
-        input_data     = _build_feature_vector(expected_features, payload["features"])
-        raw_prediction = float(model.predict(input_data)[0])
+        input_df       = _build_feature_vector(artifact, payload["features"])
+        raw_prediction = float(model.predict(input_df)[0])
         if use_log:
             raw_prediction = float(np.expm1(max(0.0, raw_prediction)))
         raw_prediction = float(np.clip(raw_prediction, 0.0, 500.0))
@@ -547,7 +488,7 @@ def predict_aqi(model_type: str, horizon: int):
 
 
 @app.route("/metrics/<string:model_type>", methods=["GET"])
-def get_model_metrics(model_type):
+def get_model_metrics(model_type: str):
     model_type = model_type.lower()
     if model_type not in VALID_MODELS:
         return jsonify({"error": f"Invalid model. Choose from: {VALID_MODELS}"}), 400
@@ -563,7 +504,7 @@ def get_all_metrics():
 def get_shap(model_type: str, horizon: int):
     """Returns top-10 SHAP records from model_shap collection for a given model+horizon."""
     model_type = model_type.lower()
-    store_name = _API_TO_STORE_NAME.get(model_type)
+    store_name = _API_TO_MONGO_NAME.get(model_type)
     if not store_name:
         return jsonify({"error": f"Unknown model type: {model_type!r}. Choose from: {VALID_MODELS}"}), 400
     if horizon not in VALID_HORIZONS:
@@ -623,7 +564,7 @@ def debug_features_raw():
 
 @app.route("/debug/artifacts", methods=["GET"])
 def debug_artifacts():
-    """Lists all model artifacts stored in MongoDB (model_name, horizon, updated_at)."""
+    """Lists all model artifacts stored in MongoDB (model_name, horizon, feature_count, updated_at)."""
     try:
         client = _mongo_client()
         db     = client[DB_NAME]
@@ -642,4 +583,4 @@ def debug_artifacts():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=False)   # ← RENDER FIX 4: debug=False
+    app.run(host="0.0.0.0", port=port, debug=False)

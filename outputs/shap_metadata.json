@@ -1,0 +1,26 @@
+[
+    {
+        "horizon_h": 24,
+        "model": "RandomForest",
+        "gridfs_filename": "shap_plot_RandomForest_24h.png",
+        "gridfs_id": "6a2483ac4a7991158014662e",
+        "run_id": "20260606T201914Z",
+        "updated_at": "2026-06-06 20:31:42.759000"
+    },
+    {
+        "horizon_h": 48,
+        "model": "RandomForest",
+        "gridfs_filename": "shap_plot_RandomForest_48h.png",
+        "gridfs_id": "6a24868a4a799115801466cd",
+        "run_id": "20260606T203143Z",
+        "updated_at": "2026-06-06 20:43:56.347000"
+    },
+    {
+        "horizon_h": 72,
+        "model": "RandomForest",
+        "gridfs_filename": "shap_plot_RandomForest_72h.png",
+        "gridfs_id": "6a2489694a7991158014676b",
+        "run_id": "20260606T204356Z",
+        "updated_at": "2026-06-06 20:56:10.901000"
+    }
+]

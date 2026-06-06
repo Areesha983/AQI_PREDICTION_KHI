@@ -7,3 +7,5 @@ __pycache__/
 *.pkl
 *.keras
 *.csv
+eda/data/
+eda/outputs/
