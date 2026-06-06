@@ -147,7 +147,7 @@ def train_rf(horizon: int) -> dict:
     # ── 3. Hyperparameter search ──────────────────────────────────────────────
     # R2 v3-1: Wider grid
     param_dist = {
-        "n_estimators":      [200, 300, 400, 500, 600],   # R2 v3-1
+        "n_estimators":      [100,200,300],   # R2 v3-1
         "max_depth":         [20, 28, 35, None],           # FIX: dropped 15 (too shallow for 151 features)
         "min_samples_leaf":  [2, 3, 4, 6, 8],              # FIX: added 2 for better spike capture
         "min_samples_split": [4, 6, 10, 14],
@@ -192,7 +192,7 @@ def train_rf(horizon: int) -> dict:
     sample_weights = _rank_weights(y_aug_raw_vals, cap=10.0)  # FIX: matches search cap
 
     # ── 5. Final model fit ────────────────────────────────────────────────────
-    final_params = {**best_params, "n_estimators": min(best_params["n_estimators"], 500)}
+    final_params = {**best_params, "n_estimators": min(best_params["n_estimators"], 150)}
     model = RandomForestRegressor(
         **final_params,
         max_samples=0.90,   # R2 v3-3
