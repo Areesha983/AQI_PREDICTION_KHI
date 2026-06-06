@@ -1,6 +1,6 @@
 pymongo[srv]==4.6.1
 pandas>=2.2.3
-numpy>=1.26.4
+numpy<2
 scikit-learn>=1.4.0
 flask==3.0.2
 flask-cors
@@ -15,3 +15,9 @@ xgboost==2.0.3
 gunicorn==21.2.0
 certifi==2024.2.2
 pyarrow>=15.0.0
+streamlit
+requests
+pandas
+plotly
+pymongo
+python-dotenv
