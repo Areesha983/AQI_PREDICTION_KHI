@@ -7,6 +7,8 @@ or an incremental hourly/daily catch-up based on existing database state.
 """
 
 import os
+import ssl
+import certifi
 import requests
 import pymongo
 from pymongo import UpdateOne
@@ -19,7 +21,6 @@ BULK_BATCH_SIZE = 1000
 def get_dynamic_start_date(collection) -> str:
     """Checks MongoDB for the latest entry to determine incremental pipeline window."""
     try:
-        # Find the document with the maximum/latest datetime string
         latest_record = collection.find_one(
             filter={},
             projection={"datetime": 1, "_id": 0},
@@ -28,7 +29,6 @@ def get_dynamic_start_date(collection) -> str:
         
         if latest_record and "datetime" in latest_record:
             latest_dt = datetime.strptime(latest_record["datetime"], "%Y-%m-%d %H:%M:%S")
-            # Step back 2 days as an operational safety buffer zone to recapture any missing/delayed hours
             buffer_dt = latest_dt - timedelta(days=2)
             print(f" -> Found existing records up to {latest_record['datetime']}. Setting buffer lookback.")
             return buffer_dt.strftime("%Y-%m-%d")
@@ -75,7 +75,6 @@ def fetch_air_quality(start_date: str, end_date: str) -> pd.DataFrame:
     aq_df["datetime"] = pd.to_datetime(aq_df["time"])
     aq_df = aq_df.drop(columns=["time"])
 
-    # Core renaming transformations
     rename_map = {
         "pm2_5": "pm25",
         "carbon_monoxide": "co",
@@ -84,7 +83,6 @@ def fetch_air_quality(start_date: str, end_date: str) -> pd.DataFrame:
     }
     aq_df = aq_df.rename(columns=rename_map)
 
-    # Data validation pass
     total_rows = len(aq_df)
     pm25_nans = aq_df["pm25"].isna().sum()
     pm25_nan_pct = (pm25_nans / total_rows) * 100
@@ -100,17 +98,18 @@ def main():
     if not mongo_uri:
         raise ValueError("MONGODB_URI environment variable is missing!")
 
+    # FIX: removed tlsAllowInvalidCertificates=True — incompatible with Atlas M0 TLS enforcement.
+    # Use certifi's CA bundle instead for proper certificate validation on Render.
     client = pymongo.MongoClient(
-    mongo_uri,
-    serverSelectionTimeoutMS=15000,
-    connectTimeoutMS=15000,
-    socketTimeoutMS=15000,
-    tlsAllowInvalidCertificates=True  # Bypasses local runner certificate validation barriers
-)
+        mongo_uri,
+        serverSelectionTimeoutMS=15000,
+        connectTimeoutMS=15000,
+        socketTimeoutMS=15000,
+        tlsCAFile=certifi.where(),
+    )
     db = client["karachi_aqi"]
     collection = db["raw_air_quality"]
 
-    # Calculate dates dynamically based on current collection data state
     start_date = get_dynamic_start_date(collection)
     end_date = get_end_date()
     
@@ -129,7 +128,6 @@ def main():
         client.close()
         return
 
-    # Bulk upsert logic using standard compound keys
     operations = [UpdateOne({"datetime": r["datetime"]}, {"$set": r}, upsert=True) for r in records]
     total_batches = (len(operations) + BULK_BATCH_SIZE - 1) // BULK_BATCH_SIZE
 

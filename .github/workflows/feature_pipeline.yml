@@ -18,7 +18,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10' # Upgraded to match the 3.10 standard in load_data.py
+          python-version: '3.11' # 3.11 required for X | None union type hint syntax in load_data.py
           cache: 'pip'          # Enables automated caching to speed up subsequent workflow runs
 
       - name: Install dependencies

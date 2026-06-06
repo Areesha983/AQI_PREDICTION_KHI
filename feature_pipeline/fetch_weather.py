@@ -7,6 +7,7 @@ and request incremental catch-up data matrices selectively.
 """
 
 import os
+import certifi
 import requests
 import pymongo
 from pymongo import UpdateOne
@@ -84,13 +85,14 @@ def main():
     if not mongo_uri:
         raise ValueError("MONGODB_URI environment variable is missing!")
 
+    # FIX: removed tlsAllowInvalidCertificates=True — use certifi CA bundle instead.
     client = pymongo.MongoClient(
-    mongo_uri,
-    serverSelectionTimeoutMS=15000,
-    connectTimeoutMS=15000,
-    socketTimeoutMS=15000,
-    tlsAllowInvalidCertificates=True  # Bypasses local runner certificate validation barriers
-)
+        mongo_uri,
+        serverSelectionTimeoutMS=15000,
+        connectTimeoutMS=15000,
+        socketTimeoutMS=15000,
+        tlsCAFile=certifi.where(),
+    )
     db = client["karachi_aqi"]
     collection = db["raw_weather"]
 

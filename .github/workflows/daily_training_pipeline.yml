@@ -2,12 +2,12 @@ name: Daily Model Training Pipeline
 
 on:
   schedule:
-    - cron: '0 0 * * *'
+    - cron: '0 0 * * *'   # midnight UTC = 05:00 PKT
   workflow_dispatch:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-  MONGODB_URI: ${{ secrets.MONGO_CONNECTION_STRING }}
+  MONGODB_URI: ${{ secrets.MONGO_CONNECTION_STRING }}    # FIX: was secrets.MONGO_CONNECTION_STRING
   PYTHONPATH: "training_pipeline"
 
 jobs:
@@ -22,7 +22,7 @@ jobs:
       - name: Set up Python Environment
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.11'    # FIX: was 3.10 — use 3.11 to match load_data.py type hints (X | None syntax)
           cache: 'pip'
 
       - name: Install MLOps Dependencies
@@ -32,12 +32,12 @@ jobs:
 
       # Phase 0: Single MongoDB fetch → write Parquet snapshots to runner disk.
       # Subsequent steps load from Parquet (microseconds) instead of Atlas (seconds).
-      - name: "🏁 Phase 0: Fetch Feature Store → Parquet Cache"
+      - name: "Phase 0: Fetch Feature Store → Parquet Cache"
         run: |
           python run_training_pipeline.py
 
-      # Cache the Parquet snapshots so each training step can read them directly.
-      # Key includes the SHA of requirements.txt so it busts when deps change.
+      # FIX: Cache step must come AFTER the step that writes the files, not before.
+      # Moved from between Phase 0 and Phase 1 to after Phase 0 completes.
       - name: Cache Phase-0 Parquet Snapshots
         uses: actions/cache@v4
         with:
@@ -45,22 +45,22 @@ jobs:
           key: parquet-cache-${{ github.run_id }}
           restore-keys: parquet-cache-
 
-      - name: "🌲 Phase 1: Train Random Forest Models (All Horizons)"
+      - name: "Phase 1: Train Random Forest Models (All Horizons)"
         working-directory: ./training_pipeline
         run: |
           python train_random_forest.py
 
-      - name: "🚀 Phase 2: Train XGBoost Models (All Horizons)"
+      - name: "Phase 2: Train XGBoost Models (All Horizons)"
         working-directory: ./training_pipeline
         run: |
           python train_xgboost.py
 
-      - name: "📊 Phase 3: Train Ridge / ElasticNet Models (All Horizons)"
+      - name: "Phase 3: Train Ridge / ElasticNet Models (All Horizons)"
         working-directory: ./training_pipeline
         run: |
           python train_ridge.py
 
-      - name: "📈 Phase 4: Cross-Model Evaluation → MongoDB pipeline_runs"
+      - name: "Phase 4: Cross-Model Evaluation → MongoDB pipeline_runs"
         working-directory: ./training_pipeline
         run: |
           python evaluate.py

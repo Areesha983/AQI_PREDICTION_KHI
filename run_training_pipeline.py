@@ -27,7 +27,9 @@ PIPELINE_DIR = ROOT_DIR / "training_pipeline"
 if str(PIPELINE_DIR) not in sys.path:
     sys.path.insert(0, str(PIPELINE_DIR))
 
-from training_pipeline import load_data as _ld
+# FIX: was "from training_pipeline import load_data as _ld" which requires
+# an __init__.py package. Since PIPELINE_DIR is already on sys.path, import directly.
+import load_data as _ld
 
 # Temporary Parquet cache dir (only used across separate process steps)
 CACHE_DIR = PIPELINE_DIR / "_parquet_cache"

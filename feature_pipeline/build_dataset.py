@@ -10,6 +10,7 @@ OPTIMIZED LAYER CONFIGURATION:
 """
 
 import os
+import certifi
 import pymongo
 from pymongo import UpdateOne
 import pandas as pd
@@ -27,13 +28,13 @@ def main():
     if not mongo_uri:
         raise ValueError("MONGODB_URI environment variable is missing!")
 
-    # Set fault-tolerant network fallback parameters
+    # FIX: removed tlsAllowInvalidCertificates=True — use certifi CA bundle instead.
     client = pymongo.MongoClient(
         mongo_uri,
         serverSelectionTimeoutMS=15000,
         connectTimeoutMS=15000,
-        socketTimeoutMS=30000,           # Elevated to 30s to permit larger batch transfers safely
-        tlsAllowInvalidCertificates=True
+        socketTimeoutMS=30000,
+        tlsCAFile=certifi.where(),
     )
     db = client["karachi_aqi"]
 
@@ -41,7 +42,6 @@ def main():
     print(" ORCHESTRATING INCREMENTAL DATA EXTRACTION LAYER")
     print("=" * 70)
 
-    # 1. Trigger dynamic data catch-up APIs
     fetch_air_quality.main()
     fetch_weather.main()
 
@@ -49,10 +49,6 @@ def main():
     print(" CONSOLIDATING WEATHER AND AIR QUALITY RECORDS")
     print("=" * 70)
 
-    # 2. OPTIMIZATION: Determine the merge window dynamically.
-    # Check the latest datetime already in karachi_aqi_dataset and only re-merge rows
-    # newer than that (with a 2-day safety buffer for rows stored with missing AQ values).
-    # Falls back to a 5-day window when the collection is empty (first run).
     dataset_collection = db["karachi_aqi_dataset"]
     latest_dataset_doc = dataset_collection.find_one(
         filter={},
@@ -83,42 +79,33 @@ def main():
         client.close()
         return
 
-    # Enforce standard timestamp datatype transformations
     weather_df["datetime"]     = pd.to_datetime(weather_df["datetime"])
     air_quality_df["datetime"] = pd.to_datetime(air_quality_df["datetime"])
 
-    # Ensure uniqueness across temporal indices before structural merge
     weather_df     = weather_df.drop_duplicates(subset=["datetime"])
     air_quality_df = air_quality_df.drop_duplicates(subset=["datetime"])
 
-    # 3. Apply Left Join on Weather Archive anchors
     dataset = pd.merge(weather_df, air_quality_df, on="datetime", how="left")
     dataset = dataset.sort_values("datetime").reset_index(drop=True)
     print(f" -> Delta matrix generated. Aligned slice footprint: {dataset.shape}")
 
-    # 4. Leakage-Free Causal Capping
     dataset = dataset.set_index("datetime")
     initial_len = len(dataset)
     pm25_nulls_before = dataset["pm25"].isna().sum()
 
-    # Apply causal forward-fill capped tightly to handle brief hardware API drops
     dataset = dataset.ffill(limit=MAX_GAP_FILL_HOURS)
     dataset = dataset.reset_index()
-
-    # Drop any severe persistent data voids that forward-filling cannot fix
     dataset = dataset.dropna(subset=["pm25"]).reset_index(drop=True)
     
     dropped = initial_len - len(dataset)
     print(f" -> Imputed {pm25_nulls_before - dataset['pm25'].isna().sum()} short voids.")
 
-    # 5. Push Aligned Matrix straight into 'karachi_aqi_dataset' Collection via upsert
     dataset_upload = dataset.copy()
     dataset_upload["datetime"] = dataset_upload["datetime"].dt.strftime("%Y-%m-%d %H:%M:%S")
     records = dataset_upload.to_dict(orient="records")
 
     if records:
         output_collection = db["karachi_aqi_dataset"]
-        # Ensure datetime index exists so range queries stay fast on every run
         output_collection.create_index("datetime", unique=True, background=True)
         print(f"Saving {len(records):,} synced entries via fast bulk execution...")
 

@@ -20,7 +20,10 @@ CHANGES vs previous version:
   This is identical to what the old joblib.load() returned, so no other
   call-site changes were needed.
 
-All other fixes from the previous version (FIX 1–11) are preserved unchanged.
+RENDER FIXES:
+  - Added flask-cors: CORS(app) so Streamlit frontend can call this API
+  - Removed duplicate home() route that conflicted with index()
+  - Set debug=False for production safety
 """
 
 import os
@@ -30,6 +33,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 
 from pathlib import Path
 from flask import Flask, jsonify, request
+from flask_cors import CORS                          # ← RENDER FIX 1: import CORS
 import numpy as np
 import pandas as pd
 from pymongo import MongoClient
@@ -47,6 +51,7 @@ FEAT_COL    = "processed_features"
 METRICS_COL = "model_metrics"
 
 app = Flask(__name__)
+CORS(app)                                            # ← RENDER FIX 2: enable CORS
 
 MODEL_CACHE    = {}   # key: "random_forest_24" → artifact dict
 VALID_MODELS   = ["random_forest", "xgboost", "ridge"]   # list: deterministic order
@@ -84,12 +89,9 @@ _METRIC_ALIASES = {
     "margin":   ["margin", "Margin", "conformal_margin_width", "conformal_margin"],
 }
 
-@app.route("/")
-def home():
-    return {
-        "status": "running",
-        "service": "Karachi AQI Predictor"
-    }
+# ← RENDER FIX 3: removed duplicate home() route — index() below is the real root
+
+
 def _mongo_client():
     if not MONGO_URI:
         raise ValueError("MONGODB_URI is not set in environment / .env")
@@ -433,41 +435,44 @@ def _metrics_from_mongo(model_type: str) -> dict:
 
     return report
 
+
+# ── Routes ────────────────────────────────────────────────────────────────────
 @app.route("/", methods=["GET"])
 def index():
-    """Root endpoint to confirm the API is active."""
+    """Root endpoint — confirms the API is online (required by Render health checks)."""
     return jsonify({
         "message": "AQI Prediction API is active.",
         "service": "Karachi AQI Forecasting API",
-        "status": "running",
+        "status":  "running",
         "endpoints": {
-            "health": "/health",
-            "latest_features": "/latest_features",
-            "predict_24h_rf": "/predict/random_forest/24",
-            "predict_24h_xgb": "/predict/xgboost/24",
-            "predict_24h_ridge": "/predict/ridge/24",
-            "metrics_rf": "/metrics/random_forest",
-            "metrics_xgb": "/metrics/xgboost",
-            "metrics_ridge": "/metrics/ridge",
-            "all_metrics": "/metrics/all",
-            "debug_artifacts": "/debug/artifacts",
-            "debug_features": "/debug/features_raw",
-            "debug_metrics": "/debug/metrics_raw"
-        }
+            "health":           "/health",
+            "latest_features":  "/latest_features",
+            "predict_24h_rf":   "/predict/random_forest/24",
+            "predict_24h_xgb":  "/predict/xgboost/24",
+            "predict_24h_ridge":"/predict/ridge/24",
+            "metrics_rf":       "/metrics/random_forest",
+            "metrics_xgb":      "/metrics/xgboost",
+            "metrics_ridge":    "/metrics/ridge",
+            "all_metrics":      "/metrics/all",
+            "debug_artifacts":  "/debug/artifacts",
+            "debug_features":   "/debug/features_raw",
+            "debug_metrics":    "/debug/metrics_raw",
+        },
     }), 200
-# ── Routes ────────────────────────────────────────────────────────────────────
+
+
 @app.route("/health", methods=["GET"])
 def health_check():
     mongo_summary = _get_latest_metrics_doc()
     feat_doc      = _get_latest_feature_doc()
     return jsonify({
-        "status":                 "healthy",
-        "service":                "aqi-multi-model-forecasting-api",
-        "storage_backend":        "MongoDB Atlas (no local files)",
-        "warmed_models_in_cache": list(MODEL_CACHE.keys()),
-        "mongo_connected":        MONGO_URI is not None,
-        "metrics_in_mongo":       mongo_summary is not None,
-        "features_in_mongo":      feat_doc is not None,
+        "status":                  "healthy",
+        "service":                 "aqi-multi-model-forecasting-api",
+        "storage_backend":         "MongoDB Atlas (no local files)",
+        "warmed_models_in_cache":  list(MODEL_CACHE.keys()),
+        "mongo_connected":         MONGO_URI is not None,
+        "metrics_in_mongo":        mongo_summary is not None,
+        "features_in_mongo":       feat_doc is not None,
         "feature_doc_sample_keys": list(feat_doc.keys())[:8] if feat_doc else [],
     }), 200
 
@@ -543,12 +548,8 @@ def predict_aqi(model_type: str, horizon: int):
 @app.route("/metrics/<string:model_type>", methods=["GET"])
 def get_model_metrics(model_type):
     model_type = model_type.lower()
-
     if model_type not in VALID_MODELS:
-        return jsonify({
-            "error": f"Invalid model. Choose from: {VALID_MODELS}"
-        }), 400
-
+        return jsonify({"error": f"Invalid model. Choose from: {VALID_MODELS}"}), 400
     return jsonify(_metrics_from_mongo(model_type))
 
 
@@ -563,7 +564,6 @@ def debug_metrics_raw():
     try:
         client = _mongo_client()
         db     = client[DB_NAME]
-        # Return up to 5 documents so you can see the per-model-per-horizon shape
         docs   = list(db[METRICS_COL].find({}, {"_id": 0}).sort("updated_at", -1).limit(5))
         client.close()
         return jsonify({"found": bool(docs), "count": len(docs), "docs": docs}), 200
@@ -586,7 +586,7 @@ def debug_features_raw():
             return jsonify({"found": True, "doc": doc}), 200
         return jsonify({
             "found": False,
-            "hint": "processed_features is empty. Run the feature pipeline first.",
+            "hint":  "processed_features is empty. Run the feature pipeline first.",
         }), 200
     except PyMongoError as e:
         return jsonify({"error": str(e)}), 500
@@ -613,4 +613,4 @@ def debug_artifacts():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=True, use_reloader=False)
+    app.run(host="0.0.0.0", port=port, debug=False)   # ← RENDER FIX 4: debug=False
