@@ -84,7 +84,7 @@ def _gridfs_upsert(filename: str, data: bytes, metadata: dict) -> str:
 
     existing_files = list(fs.find(query).sort("uploadDate", -1))
 
-    KEEP_N = 2
+    KEEP_N = 1  # Keep only the single latest version to minimise M0 storage usage
 
     if len(existing_files) >= KEEP_N:
         for old_file in existing_files[KEEP_N - 1:]:
@@ -370,3 +370,57 @@ def load_latest_metrics(model: str, horizon: int) -> dict | None:
         {"model": model, "horizon_h": horizon},
         {"_id": 0},
     )
+
+
+def prune_old_artifacts(model_name: str, horizon: int, keep_last: int = 1) -> int:
+    """
+    Removes older GridFS model artifacts for a given (model_name, horizon) pair,
+    keeping only the `keep_last` most recent versions.
+
+    Returns the number of files deleted.
+
+    NOTE: The snippet in the Atlas dashboard suggestion referenced bare `db` and
+    `fs` globals — those don't exist in this module.  This version correctly uses
+    _get_fs() so it is safe to call from anywhere.
+
+    Usage:
+        from mongo_store import prune_old_artifacts
+        prune_old_artifacts("RandomForest", 24)        # keep only the latest
+        prune_old_artifacts("XGBoost", 48, keep_last=2)
+    """
+    fs = _get_fs()
+    cursor = fs.find(
+        {"metadata.model": model_name, "metadata.horizon_h": horizon}
+    ).sort("uploadDate", -1)
+
+    all_files = list(cursor)
+    to_delete = all_files[keep_last:]
+    deleted = 0
+    for doc in to_delete:
+        try:
+            fs.delete(doc._id)
+            deleted += 1
+            print(f"  [mongo_store] 🗑  prune_old_artifacts: deleted {doc._id} ({model_name} {horizon}h)")
+        except Exception as e:
+            print(f"  [mongo_store] ⚠️  Could not delete {doc._id}: {e}")
+    return deleted
+
+
+def prune_all_artifacts(keep_last: int = 1) -> None:
+    """
+    Convenience wrapper: prunes GridFS artifacts for every known
+    (model, horizon) combination in one call.
+
+    Run this once from a Python shell to immediately recover Atlas M0 storage
+    after a write-block, then rely on _gridfs_upsert's single-version
+    enforcement going forward:
+
+        python -c "from mongo_store import prune_all_artifacts; prune_all_artifacts()"
+    """
+    models   = ["RandomForest", "XGBoost", "Ridge"]
+    horizons = [24, 48, 72]
+    total    = 0
+    for m in models:
+        for h in horizons:
+            total += prune_old_artifacts(m, h, keep_last=keep_last)
+    print(f"  [mongo_store] ✅ prune_all_artifacts complete — {total} file(s) deleted.")
