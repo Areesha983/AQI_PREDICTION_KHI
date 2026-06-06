@@ -2,31 +2,20 @@
 AirLyst Karachi — AQI Intelligence Dashboard
 Streamlit frontend consuming a Flask prediction microservice.
 
-FIXES IN THIS VERSION (on top of previous BUG 1–6 fixes):
+DEPLOYMENT FIXES (on top of previous FIX A–D):
 
-  FIX A — _fallback_pred() was fabricating AQI numbers using hardcoded math
-    when Flask was unreachable. This violated the "all data from MongoDB only"
-    requirement and silently showed made-up predictions with no indication they
-    were fake. Removed entirely. Sections that cannot reach Flask now show an
-    explicit st.error() / st.warning() so the user knows the data is missing.
+  FIX DEPLOY-1 — api_gateway default was "http://127.0.0.1:5000" which
+    breaks on Streamlit Cloud. Now reads from st.secrets["API_BASE_URL"]
+    with the Render URL as fallback.
 
-  FIX B — inference_payload had two hardcoded constants:
-      "pm25_diff_1h":     2.3
-      "pm25_roll_std_24h": 12.4
-    These are features the model uses, so feeding wrong values silently biases
-    every prediction. They are now seeded from mongo_features (same lookup
-    pattern as the slider seeds) with documented fallback to 0.0 when the
-    processed_features collection doesn't contain them yet.
+  FIX DEPLOY-2 — _load_mongo_features() called database.get_latest_features()
+    directly (MongoDB). On Streamlit Cloud there is no MONGODB_URI so this
+    always failed. Replaced with a call to the Flask /latest_features endpoint
+    which already proxies MongoDB correctly.
 
-  FIX C — _load_mongo_features() used a bare `except: pass` that swallowed
-    every error silently. It now captures and surfaces the exception message
-    so the user knows whether the issue is a missing MONGODB_URI, a network
-    block, or an empty collection.
-
-  FIX D — _fetch_prediction() used a 2-second timeout. Flask deserialises the
-    model artifact from MongoDB base64 on first call which can take 3–5 s on a
-    cold start. The timeout is raised to 15 s to prevent silent fallback to
-    fabricated numbers on a healthy but cold Flask instance.
+  FIX DEPLOY-3 — _d() and mongo_features were defined inside `with st.sidebar:`
+    but used outside it (inference_payload). Moved both above the sidebar block
+    so they are always in scope.
 """
 
 import streamlit as st
@@ -35,12 +24,6 @@ import requests
 
 from alerts import get_epa_tier_details
 from visualizations import plot_error_progression, plot_variance_matrix, plot_aqi_gauge
-
-try:
-    from database import get_latest_features
-    _DB_AVAILABLE = True
-except ModuleNotFoundError:
-    _DB_AVAILABLE = False
 
 # ─── PAGE CONFIG ─────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -151,6 +134,48 @@ section[data-testid="stSidebarCollapsedControl"] { visibility: visible !importan
 """, unsafe_allow_html=True)
 
 
+# ─── FIX DEPLOY-2: fetch latest features from Flask API, not MongoDB directly ─
+@st.cache_data(ttl=30)
+def _load_mongo_features(gateway: str) -> tuple[dict, bool, str | None]:
+    """
+    Returns (features_dict, is_active, error_message).
+    Calls Flask /latest_features instead of hitting MongoDB directly,
+    so this works on Streamlit Cloud without a MONGODB_URI secret.
+    """
+    try:
+        resp = requests.get(f"{gateway}/latest_features", timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            if data and isinstance(data, dict):
+                return data, True, None
+            return {}, False, "API returned empty feature document."
+        return {}, False, f"Flask /latest_features returned HTTP {resp.status_code}."
+    except requests.exceptions.ConnectionError:
+        return {}, False, f"Cannot reach Flask API at {gateway}."
+    except requests.exceptions.Timeout:
+        return {}, False, "Flask /latest_features timed out."
+    except Exception as exc:
+        return {}, False, str(exc)
+
+
+# ─── FIX DEPLOY-3: _d() and mongo_features defined at module level ────────────
+# Previously inside `with st.sidebar:` but used outside it in inference_payload.
+mongo_features: dict = {}
+
+
+def _d(raw_key: str, lag_key: str, default: float) -> float:
+    """Try lag-1 field name first (how processed_features stores it),
+    then the raw field name, then fall back to the supplied default."""
+    for k in (lag_key, raw_key):
+        v = mongo_features.get(k)
+        if v is not None:
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                pass
+    return default
+
+
 # ─── SIDEBAR ─────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("""
@@ -165,7 +190,9 @@ with st.sidebar:
     """, unsafe_allow_html=True)
 
     st.markdown("##### 🔗 Backend")
-    api_gateway = st.text_input("Flask API URL", "http://127.0.0.1:5000", label_visibility="collapsed")
+    # FIX DEPLOY-1: default to Render URL from secrets, not localhost
+    _default_url = st.secrets.get("API_BASE_URL", "https://aqi-prediction-khi.onrender.com")
+    api_gateway = st.text_input("Flask API URL", _default_url, label_visibility="collapsed")
 
     st.markdown("##### 🤖 Model")
     selected_model_ui = st.selectbox(
@@ -183,41 +210,10 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("##### 🎯 Input Vectors")
 
-    # ── Seed sliders from MongoDB using correct lag-1 field names ─────────────
-    # processed_features stores "pm25_lag_1", not "pm25". Try lag key first,
-    # then raw key, then the supplied default.
-    @st.cache_data(ttl=30)
-    def _load_mongo_features() -> tuple[dict, bool, str | None]:
-        """
-        Returns (features_dict, is_active, error_message).
-
-        FIX C: was bare `except: pass` which swallowed all errors silently.
-        Now returns the error string so the sidebar can show the user why
-        the feature store is unavailable.
-        """
-        if not _DB_AVAILABLE:
-            return {}, False, "database.py not found — cannot import get_latest_features."
-        try:
-            rec = get_latest_features()
-            if rec and isinstance(rec, dict):
-                return rec, True, None
-            return {}, False, "get_latest_features() returned None — processed_features collection may be empty."
-        except Exception as exc:
-            return {}, False, str(exc)
-
-    mongo_features, mongo_active, mongo_error = _load_mongo_features()
-
-    def _d(raw_key: str, lag_key: str, default: float) -> float:
-        """Try lag-1 field name first (how processed_features stores it),
-        then the raw field name, then fall back to the supplied default."""
-        for k in (lag_key, raw_key):
-            v = mongo_features.get(k)
-            if v is not None:
-                try:
-                    return float(v)
-                except (TypeError, ValueError):
-                    pass
-        return default
+    # FIX DEPLOY-2: call updated function with gateway argument
+    _fetched, mongo_active, mongo_error = _load_mongo_features(api_gateway)
+    # Update the module-level dict so _d() picks up live values
+    mongo_features.update(_fetched)
 
     sim_pm25     = st.slider("PM2.5 (μg/m³)",    10.0, 350.0, _d("pm25",        "pm25_lag_1",        75.0), 5.0)
     sim_pm10     = st.slider("PM10 (μg/m³)",      20.0, 500.0, _d("pm10",        "pm10_lag_1",       140.0), 5.0)
@@ -229,21 +225,15 @@ with st.sidebar:
     db_dot = "🟢" if mongo_active else "🔴"
     st.markdown(f"""
         <div style='font-size:0.72rem; color:#475569;'>
-            {db_dot} {'Mongo feature store' if mongo_active else 'Fallback defaults'}
+            {db_dot} {'Live feature store' if mongo_active else 'Fallback defaults'}
         </div>
     """, unsafe_allow_html=True)
 
-    # FIX C: surface the reason the feature store is unavailable
     if not mongo_active and mongo_error:
         st.caption(f"⚠️ {mongo_error}")
 
 
 # ─── INFERENCE PAYLOAD ───────────────────────────────────────────────────────
-# FIX B: pm25_diff_1h and pm25_roll_std_24h were hardcoded constants (2.3 and
-# 12.4). They are now seeded from mongo_features using the same lag-key lookup
-# pattern as the sliders. Falls back to 0.0 when the field isn't present yet —
-# which is safe because Flask's _build_feature_vector() also fills missing
-# features with 0.0 using the latest MongoDB doc as base.
 inference_payload = {
     "features": {
         "pm25":                          sim_pm25,
@@ -251,8 +241,8 @@ inference_payload = {
         "temperature":                   sim_temp,
         "humidity":                      sim_humidity,
         "wind_speed":                    sim_wind,
-        "pm25_diff_1h":                  _d("pm25_diff_1h",     "pm25_diff_1h",     0.0),
-        "pm25_roll_std_24h":             _d("pm25_roll_std_24h","pm25_roll_std_24h", 0.0),
+        "pm25_diff_1h":                  _d("pm25_diff_1h",      "pm25_diff_1h",      0.0),
+        "pm25_roll_std_24h":             _d("pm25_roll_std_24h", "pm25_roll_std_24h", 0.0),
         "interaction_pm25_humidity":     sim_pm25 * sim_humidity,
         "interaction_pm25_wind_inverse": sim_pm25 / (sim_wind + 0.1),
     }
@@ -284,8 +274,7 @@ def _fetch_prediction(model_key: str, horizon: int) -> dict | None:
     """
     FIX D: timeout raised from 2s → 15s.
     Flask deserialises the model artifact from MongoDB base64 on the first
-    call which can take 3–5 s on a cold runner. 2 s caused silent fallback
-    to fabricated numbers even when Flask was healthy.
+    call which can take 3–5 s on a cold runner.
     """
     try:
         r = requests.post(
@@ -295,7 +284,6 @@ def _fetch_prediction(model_key: str, horizon: int) -> dict | None:
         )
         if r.status_code == 200:
             return r.json()
-        # Surface non-200 responses so the user knows what went wrong
         st.warning(
             f"Flask returned HTTP {r.status_code} for {model_key}/{horizon}h. "
             f"Response: {r.text[:200]}"
@@ -329,11 +317,10 @@ except requests.exceptions.ConnectionError:
     _flask_reachable = False
     st.error(
         f"**Cannot reach Flask API at `{api_gateway}`.**\n\n"
-        "Start the API with `python api/app.py` and reload this page. "
         "Predictions require a live connection — no fabricated fallback values are shown."
     )
 except Exception:
-    pass  # non-connection errors (e.g. bad URL) will surface per-prediction below
+    pass  # non-connection errors will surface per-prediction below
 
 for idx, h in enumerate(horizons):
     data = None
@@ -347,7 +334,6 @@ for idx, h in enumerate(horizons):
             fig  = plot_aqi_gauge(pred, tier, f"{h}h Forecast")
             st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
         else:
-            # FIX A: show a placeholder instead of fabricated numbers
             st.markdown(
                 f"""<div class="card" style="text-align:center; padding:40px 20px;">
                     <div style="font-size:0.75rem; color:#475569; font-family:'JetBrains Mono',monospace;">
@@ -366,7 +352,6 @@ for idx, h in enumerate(horizons):
             low  = data["lower_bound_95ci"]
             high = data["upper_bound_95ci"]
             tier = get_epa_tier_details(pred)
-            src  = "live"
             st.markdown(f"""
             <div class="card" style="border-left: 3px solid {tier['color']}; background:{tier['bg']};">
                 <div style="font-size:0.68rem; color:#475569; text-transform:uppercase;
@@ -429,7 +414,6 @@ for idx, m_key in enumerate(all_models):
                 </div>"""
             st.markdown(f'<div style="margin-top:8px;">{cards_html}</div>', unsafe_allow_html=True)
         else:
-            # FIX A: no fabricated fallback — show explicit unavailable state
             st.markdown(
                 """<div style="padding:16px; border-radius:10px; background:rgba(255,255,255,0.02);
                               border:1px solid rgba(255,255,255,0.05); font-size:0.78rem;
@@ -454,9 +438,6 @@ def _fetch_metrics_from_api(gateway: str) -> tuple[pd.DataFrame, str | None]:
     """
     Calls GET /metrics/all on the Flask API and unpacks the response into a
     DataFrame with columns [Model, Horizon, R² Score, RMSE, Coverage].
-
-    Returns (DataFrame, error_message). If error_message is not None the
-    DataFrame will be empty and the caller should surface the error.
     """
     model_name_map = {
         "random_forest": "Random Forest",
@@ -468,8 +449,7 @@ def _fetch_metrics_from_api(gateway: str) -> tuple[pd.DataFrame, str | None]:
         resp = requests.get(f"{gateway}/metrics/all", timeout=5)
     except requests.exceptions.ConnectionError:
         return pd.DataFrame(), (
-            f"Cannot reach Flask API at **{gateway}**. "
-            "Make sure `python api/app.py` is running."
+            f"Cannot reach Flask API at **{gateway}**."
         )
     except requests.exceptions.Timeout:
         return pd.DataFrame(), "Flask API timed out while fetching metrics."
