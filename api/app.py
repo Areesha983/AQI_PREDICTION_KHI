@@ -232,8 +232,11 @@ def load_prediction_artifacts(model_type: str, horizon: int) -> dict:
         raise ValueError(f"Unknown model type: {model_type!r}")
 
     # Import here to avoid circular dependency issues at module load time
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "training_pipeline"))
     from mongo_store import load_model_artifact
-
+ 
     artifact = load_model_artifact(model_name=store_name, horizon=horizon)
     if artifact is None:
         raise FileNotFoundError(
