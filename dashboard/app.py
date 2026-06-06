@@ -433,28 +433,44 @@ st.caption(
 )
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=1800)
 def _fetch_metrics_from_api(gateway: str) -> tuple[pd.DataFrame, str | None]:
-    """
-    Calls GET /metrics/all on the Flask API and unpacks the response into a
-    DataFrame with columns [Model, Horizon, R² Score, RMSE, Coverage].
-    """
     model_name_map = {
         "random_forest": "Random Forest",
-        "xgboost":       "XGBoost",
-        "ridge":         "Ridge",
+        "xgboost": "XGBoost",
+        "ridge": "Ridge",
     }
 
     try:
-        resp = requests.get(f"{gateway}/metrics/all", timeout=5)
+        # Wake Render first
+        try:
+            requests.get(
+                f"{gateway}/health",
+                timeout=(10, 20),
+            )
+        except Exception:
+            pass
+
+        resp = requests.get(
+            f"{gateway}/metrics/all",
+            timeout=(15, 60),
+        )
+
     except requests.exceptions.ConnectionError:
         return pd.DataFrame(), (
             f"Cannot reach Flask API at **{gateway}**."
         )
+
     except requests.exceptions.Timeout:
-        return pd.DataFrame(), "Flask API timed out while fetching metrics."
+        return (
+            pd.DataFrame(),
+            "Metrics request timed out. Render may be waking from a cold start. Refresh in 30–60 seconds."
+        )
+
     except Exception as exc:
-        return pd.DataFrame(), f"Unexpected error contacting Flask API: {exc}"
+        return pd.DataFrame(), (
+            f"Unexpected error contacting Flask API: {exc}"
+        )
 
     if resp.status_code != 200:
         return pd.DataFrame(), (
