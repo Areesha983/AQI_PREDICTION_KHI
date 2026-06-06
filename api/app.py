@@ -537,7 +537,14 @@ def predict_aqi(model_type: str, horizon: int):
 
 @app.route("/metrics/<string:model_type>", methods=["GET"])
 def get_model_metrics(model_type):
-    return jsonify(_metrics_from_mongo(model_type.lower()))
+    model_type = model_type.lower()
+
+    if model_type not in VALID_MODELS:
+        return jsonify({
+            "error": f"Invalid model. Choose from: {VALID_MODELS}"
+        }), 400
+
+    return jsonify(_metrics_from_mongo(model_type))
 
 
 @app.route("/metrics/all", methods=["GET"])
