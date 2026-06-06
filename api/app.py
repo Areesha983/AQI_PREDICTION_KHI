@@ -84,7 +84,12 @@ _METRIC_ALIASES = {
     "margin":   ["margin", "Margin", "conformal_margin_width", "conformal_margin"],
 }
 
-
+@app.route("/")
+def home():
+    return {
+        "status": "running",
+        "service": "Karachi AQI Predictor"
+    }
 def _mongo_client():
     if not MONGO_URI:
         raise ValueError("MONGODB_URI is not set in environment / .env")
