@@ -24,6 +24,10 @@ RENDER FIXES:
   - Added flask-cors: CORS(app) so Streamlit frontend can call this API
   - Removed duplicate home() route that conflicted with index()
   - Set debug=False for production safety
+
+NEW:
+  - Added GET /shap/<model_type>/<horizon> — returns top-10 SHAP feature
+    importance records from the model_shap MongoDB collection.
 """
 
 import os
@@ -33,7 +37,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 
 from pathlib import Path
 from flask import Flask, jsonify, request
-from flask_cors import CORS                          # ← RENDER FIX 1: import CORS
+from flask_cors import CORS
 import numpy as np
 import pandas as pd
 from pymongo import MongoClient
@@ -51,10 +55,10 @@ FEAT_COL    = "processed_features"
 METRICS_COL = "model_metrics"
 
 app = Flask(__name__)
-CORS(app)                                            # ← RENDER FIX 2: enable CORS
+CORS(app)
 
-MODEL_CACHE    = {}   # key: "random_forest_24" → artifact dict
-VALID_MODELS   = ["random_forest", "xgboost", "ridge"]   # list: deterministic order
+MODEL_CACHE    = {}
+VALID_MODELS   = ["random_forest", "xgboost", "ridge"]
 VALID_HORIZONS = {24, 48, 72}
 
 # Map API names → evaluate.py / mongo_store names
@@ -89,14 +93,10 @@ _METRIC_ALIASES = {
     "margin":   ["margin", "Margin", "conformal_margin_width", "conformal_margin"],
 }
 
-# ← RENDER FIX 3: removed duplicate home() route — index() below is the real root
-
 
 def _mongo_client():
     if not MONGO_URI:
         raise ValueError("MONGODB_URI is not set in environment / .env")
-    # socketTimeoutMS raised to 120 s to match mongo_store.py — GridFS reads
-    # large model artifacts in chunks and can exceed the old 5 s default.
     return MongoClient(MONGO_URI, serverSelectionTimeoutMS=10_000, socketTimeoutMS=120_000)
 
 
@@ -233,10 +233,9 @@ def load_prediction_artifacts(model_type: str, horizon: int) -> dict:
 
     # Import here to avoid circular dependency issues at module load time
     import sys
-    from pathlib import Path
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "training_pipeline"))
     from mongo_store import load_model_artifact
- 
+
     artifact = load_model_artifact(model_name=store_name, horizon=horizon)
     if artifact is None:
         raise FileNotFoundError(
@@ -399,16 +398,12 @@ def _metrics_from_mongo(model_type: str) -> dict:
                     print(f"[metrics] {store_name}/{h_key} loaded from summary doc ✓")
 
         # ── Fallback path: individual model_metrics documents ────────────────
-        # train_*.py writes one flat doc per (model, horizon) via save_metrics().
-        # Query it directly when the summary doc is missing or doesn't cover this
-        # model/horizon.
         if not mongo_ok:
             try:
                 client = _mongo_client()
                 db     = client[DB_NAME]
                 col    = db[METRICS_COL]
-                # save_metrics() stores the document with "model" and "horizon_h" fields
-                m_doc = col.find_one(
+                m_doc  = col.find_one(
                     {"model": store_name, "horizon_h": h},
                     {"_id": 0},
                 )
@@ -448,18 +443,21 @@ def index():
         "service": "Karachi AQI Forecasting API",
         "status":  "running",
         "endpoints": {
-            "health":           "/health",
-            "latest_features":  "/latest_features",
-            "predict_24h_rf":   "/predict/random_forest/24",
-            "predict_24h_xgb":  "/predict/xgboost/24",
-            "predict_24h_ridge":"/predict/ridge/24",
-            "metrics_rf":       "/metrics/random_forest",
-            "metrics_xgb":      "/metrics/xgboost",
-            "metrics_ridge":    "/metrics/ridge",
-            "all_metrics":      "/metrics/all",
-            "debug_artifacts":  "/debug/artifacts",
-            "debug_features":   "/debug/features_raw",
-            "debug_metrics":    "/debug/metrics_raw",
+            "health":            "/health",
+            "latest_features":   "/latest_features",
+            "predict_24h_rf":    "/predict/random_forest/24",
+            "predict_24h_xgb":   "/predict/xgboost/24",
+            "predict_24h_ridge": "/predict/ridge/24",
+            "metrics_rf":        "/metrics/random_forest",
+            "metrics_xgb":       "/metrics/xgboost",
+            "metrics_ridge":     "/metrics/ridge",
+            "all_metrics":       "/metrics/all",
+            "shap_rf_24h":       "/shap/random_forest/24",
+            "shap_xgb_24h":      "/shap/xgboost/24",
+            "shap_ridge_24h":    "/shap/ridge/24",
+            "debug_artifacts":   "/debug/artifacts",
+            "debug_features":    "/debug/features_raw",
+            "debug_metrics":     "/debug/metrics_raw",
         },
     }), 200
 
@@ -559,6 +557,34 @@ def get_model_metrics(model_type):
 @app.route("/metrics/all", methods=["GET"])
 def get_all_metrics():
     return jsonify({m: _metrics_from_mongo(m) for m in VALID_MODELS})
+
+
+@app.route("/shap/<string:model_type>/<int:horizon>", methods=["GET"])
+def get_shap(model_type: str, horizon: int):
+    """Returns top-10 SHAP records from model_shap collection for a given model+horizon."""
+    model_type = model_type.lower()
+    store_name = _API_TO_STORE_NAME.get(model_type)
+    if not store_name:
+        return jsonify({"error": f"Unknown model type: {model_type!r}. Choose from: {VALID_MODELS}"}), 400
+    if horizon not in VALID_HORIZONS:
+        return jsonify({"error": f"Invalid horizon. Choose from: {sorted(VALID_HORIZONS)}"}), 400
+    try:
+        client = _mongo_client()
+        db     = client[DB_NAME]
+        doc    = db["model_shap"].find_one(
+            {"model": store_name, "horizon_h": horizon},
+            {"_id": 0, "records": 1},
+        )
+        client.close()
+        if not doc:
+            return jsonify({
+                "records": [],
+                "message": f"No SHAP data found for {store_name} {horizon}h. Run training pipeline first.",
+            }), 200
+        records = doc.get("records", [])[:10]   # already sorted desc by save_shap()
+        return jsonify({"model": store_name, "horizon_h": horizon, "records": records}), 200
+    except Exception as e:
+        return jsonify({"error": f"SHAP fetch failed: {str(e)}"}), 500
 
 
 @app.route("/debug/metrics_raw", methods=["GET"])
