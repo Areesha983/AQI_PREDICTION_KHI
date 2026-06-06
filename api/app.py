@@ -430,20 +430,25 @@ def _metrics_from_mongo(model_type: str) -> dict:
 
 @app.route("/", methods=["GET"])
 def index():
+    """Root endpoint to confirm the API is active."""
     return jsonify({
+        "message": "AQI Prediction API is active.",
         "service": "Karachi AQI Forecasting API",
         "status": "running",
-        "available_endpoints": [
-            "/health",
-            "/latest_features",
-            "/predict/random_forest/24",
-            "/predict/xgboost/24",
-            "/predict/ridge/24",
-            "/metrics/random_forest",
-            "/metrics/xgboost",
-            "/metrics/ridge",
-            "/metrics/all"
-        ]
+        "endpoints": {
+            "health": "/health",
+            "latest_features": "/latest_features",
+            "predict_24h_rf": "/predict/random_forest/24",
+            "predict_24h_xgb": "/predict/xgboost/24",
+            "predict_24h_ridge": "/predict/ridge/24",
+            "metrics_rf": "/metrics/random_forest",
+            "metrics_xgb": "/metrics/xgboost",
+            "metrics_ridge": "/metrics/ridge",
+            "all_metrics": "/metrics/all",
+            "debug_artifacts": "/debug/artifacts",
+            "debug_features": "/debug/features_raw",
+            "debug_metrics": "/debug/metrics_raw"
+        }
     }), 200
 # ── Routes ────────────────────────────────────────────────────────────────────
 @app.route("/health", methods=["GET"])
