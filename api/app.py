@@ -428,7 +428,23 @@ def _metrics_from_mongo(model_type: str) -> dict:
 
     return report
 
-
+@app.route("/", methods=["GET"])
+def index():
+    return jsonify({
+        "service": "Karachi AQI Forecasting API",
+        "status": "running",
+        "available_endpoints": [
+            "/health",
+            "/latest_features",
+            "/predict/random_forest/24",
+            "/predict/xgboost/24",
+            "/predict/ridge/24",
+            "/metrics/random_forest",
+            "/metrics/xgboost",
+            "/metrics/ridge",
+            "/metrics/all"
+        ]
+    }), 200
 # ── Routes ────────────────────────────────────────────────────────────────────
 @app.route("/health", methods=["GET"])
 def health_check():
