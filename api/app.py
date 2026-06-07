@@ -1,6 +1,7 @@
 """
 Enterprise MLOps Prediction API Service Layer.
 Exposes real-time endpoints for Multi-Model 24h, 48h, and 72h AQI forecasting.
+api/app.py
 
 KEY FIXES IN THIS VERSION
 ──────────────────────────
@@ -25,6 +26,23 @@ FIX 4 — NAMING CONSISTENCY
   _API_TO_MONGO_NAME mapping (the names are identical; two tables were redundant
   and a potential source of drift).
 
+FIX 5 — RANDOM FOREST GUNICORN DEADLOCK (NEW)
+  RandomForestRegressor serialised with n_jobs=-1 forks child processes during
+  predict(), which deadlocks gunicorn's sync workers (SIGKILL → 500).
+  model.n_jobs is patched to 1 immediately after loading from MongoDB so that
+  predict() is always single-threaded at serving time.
+
+FIX 6 — XGBOOST RESIDUAL CORRECTOR APPLIED AT INFERENCE (NEW)
+  train_xgboost.py fits a GradientBoostingRegressor corrector on calibration
+  residuals and saves it inside the artifact dict under the key "corrector".
+  The previous predict route ignored it entirely, causing systematically biased
+  (low) predictions and degraded R² on the dashboard.  The corrector is now
+  applied after expm1() when present in the artifact.
+
+FIX 7 — FULL TRACEBACK LOGGED ON PREDICT FAILURE (NEW)
+  The except block now prints traceback.format_exc() so the actual root cause
+  of any inference failure is visible in Render logs instead of a bare str(e).
+
 UNCHANGED
   - MongoDB-only artifact loading (GridFS via mongo_store.load_model_artifact)
   - CORS, debug=False, all existing routes (/health, /shap, /debug/*)
@@ -34,6 +52,7 @@ UNCHANGED
 import os
 import sys
 import time
+import traceback
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -282,9 +301,13 @@ def load_prediction_artifacts(model_type: str, horizon: int) -> dict:
           "use_log":          bool,
           "use_interactions": bool,      # Ridge only
           "interaction_cols": [...],     # Ridge only
+          "corrector":        <GBR>,     # XGBoost only
         }
 
     Results are cached in MODEL_CACHE for the lifetime of the process.
+
+    FIX 5: After loading a RandomForestRegressor, n_jobs is patched to 1
+    so that predict() never forks child processes inside gunicorn sync workers.
     """
     cache_key = f"{model_type}_{horizon}"
     if cache_key in MODEL_CACHE:
@@ -302,6 +325,15 @@ def load_prediction_artifacts(model_type: str, horizon: int) -> dict:
             f"No artifact found in MongoDB for model='{store_name}', horizon={horizon}h. "
             f"Run the training script for '{model_type}' first."
         )
+
+    # FIX 5: Patch n_jobs on the fitted estimator so gunicorn sync workers
+    # never attempt to fork child processes during predict().
+    # RandomForestRegressor with n_jobs=-1 uses Python multiprocessing at
+    # predict time, which deadlocks inside a forked gunicorn worker → 500.
+    model_obj = artifact.get("model")
+    if model_obj is not None and hasattr(model_obj, "n_jobs"):
+        model_obj.n_jobs = 1
+        print(f"[model-cache] Patched n_jobs=1 on {store_name} {horizon}h (gunicorn safety)")
 
     MODEL_CACHE[cache_key] = artifact
     n_features = len(artifact.get("feature_names", []))
@@ -445,16 +477,33 @@ def predict_aqi(model_type: str, horizon: int):
         return jsonify({"error": "Body must contain a 'features' key."}), 400
 
     try:
-        # FIX 2+3 — pass full artifact to model-aware builder
+        # Load artifact — n_jobs already patched to 1 inside load_prediction_artifacts
         artifact         = load_prediction_artifacts(model_type, horizon)
         model            = artifact["model"]
         conformal_margin = artifact["conformal_margin"]
         use_log          = artifact.get("use_log", False)
 
+        # Build the model-specific feature vector (handles Ridge interactions, etc.)
         input_df       = _build_feature_vector(artifact, payload["features"])
         raw_prediction = float(model.predict(input_df)[0])
+
         if use_log:
             raw_prediction = float(np.expm1(max(0.0, raw_prediction)))
+
+        # FIX 6: Apply XGBoost residual corrector when present in artifact.
+        # train_xgboost.py fits a GradientBoostingRegressor on calibration
+        # residuals and stores it under artifact["corrector"].  Without this
+        # the predictions are systematically biased low → poor dashboard R².
+        corrector = artifact.get("corrector")
+        if corrector is not None:
+            try:
+                correction     = float(corrector.predict(input_df)[0])
+                raw_prediction = float(np.clip(raw_prediction + correction, 0.0, 500.0))
+                print(f"[predict] {model_type}/{horizon}h corrector applied: Δ={correction:+.2f}")
+            except Exception as corr_err:
+                # Non-fatal: log and continue without correction
+                print(f"[predict] {model_type}/{horizon}h corrector failed (skipped): {corr_err}")
+
         raw_prediction = float(np.clip(raw_prediction, 0.0, 500.0))
 
         lower = float(np.clip(raw_prediction - conformal_margin, 0.0, 500.0))
@@ -484,6 +533,8 @@ def predict_aqi(model_type: str, horizon: int):
             "hint":  f"Train '{model_type}' and ensure mongo_store.save_model_artifact() ran.",
         }), 500
     except Exception as e:
+        # FIX 7: Print full traceback so the real root cause is visible in Render logs
+        print(f"[predict] EXCEPTION for {model_type}/{horizon}h:\n{traceback.format_exc()}")
         return jsonify({"error": f"Inference failure: {str(e)}"}), 500
 
 

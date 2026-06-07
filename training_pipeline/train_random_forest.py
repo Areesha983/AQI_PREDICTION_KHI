@@ -19,6 +19,13 @@ Previously retained fixes:
   R2 FIX 2 — min_samples_leaf minimum 4 to prevent leaf overfitting.
   R2 FIX 3 — max_samples subsampling for inter-tree diversity.
   R2 FIX 4 — Sample weight cap at 20×.
+
+FIX 5 (NEW) — GUNICORN DEADLOCK PREVENTION
+  RandomForestRegressor is fitted with n_jobs=-1 for fast training, but then
+  n_jobs is patched to 1 before serialisation via save_model_artifact().
+  This prevents the model from forking child processes during predict() when
+  loaded inside a gunicorn sync worker, which caused all RF /predict routes
+  to return HTTP 500 at serving time.
 """
 
 import json
@@ -147,19 +154,19 @@ def train_rf(horizon: int) -> dict:
     # ── 3. Hyperparameter search ──────────────────────────────────────────────
     # R2 v3-1: Wider grid
     param_dist = {
-        "n_estimators":      [100,200,300],   # R2 v3-1
-        "max_depth":         [20, 28, 35, None],           # FIX: dropped 15 (too shallow for 151 features)
-        "min_samples_leaf":  [2, 3, 4, 6, 8],              # FIX: added 2 for better spike capture
+        "n_estimators":      [100, 200, 300],
+        "max_depth":         [20, 28, 35, None],           # dropped 15 (too shallow for 151 features)
+        "min_samples_leaf":  [2, 3, 4, 6, 8],              # added 2 for better spike capture
         "min_samples_split": [4, 6, 10, 14],
         "max_features":      ["sqrt", 0.2, 0.3, 0.4, 0.5], # R2 v3-1
     }
     base_rf   = RandomForestRegressor(
-        random_state=42, n_jobs=1,
+        random_state=42, n_jobs=-1,
         max_samples=0.90,   # R2 v3-3: was 0.85
     )
     tuning_cv = TimeSeriesSplit(n_splits=3, gap=min(horizon, 24))
 
-    sw_search = _rank_weights(y_train_raw.values, cap=10.0)  # FIX: reduced cap 20→10; 20x was over-emphasizing spikes at the cost of overall R²
+    sw_search = _rank_weights(y_train_raw.values, cap=10.0)  # reduced cap 20→10
 
     search = RandomizedSearchCV(
         estimator=base_rf,
@@ -185,11 +192,11 @@ def train_rf(horizon: int) -> dict:
         X_train, y_train_log,
         y_train_raw=y_train_raw,
         spike_threshold=150,
-        target_spike_fraction=0.20,  # FIX: raised from 0.15 — more spike coverage
+        target_spike_fraction=0.20,  # raised from 0.15 — more spike coverage
     )
 
     y_aug_raw_vals = np.expm1(y_train_aug.values)
-    sample_weights = _rank_weights(y_aug_raw_vals, cap=10.0)  # FIX: matches search cap
+    sample_weights = _rank_weights(y_aug_raw_vals, cap=10.0)  # matches search cap
 
     # ── 5. Final model fit ────────────────────────────────────────────────────
     final_params = {**best_params, "n_estimators": min(best_params["n_estimators"], 150)}
@@ -197,10 +204,18 @@ def train_rf(horizon: int) -> dict:
         **final_params,
         max_samples=0.90,   # R2 v3-3
         random_state=42,
-        n_jobs=-1,
+        n_jobs=-1,          # use all cores during training
     )
     print(f"Fitting final RF (n_estimators={final_params['n_estimators']}) on augmented train set…")
     model.fit(X_train_aug, y_train_aug, sample_weight=sample_weights)
+
+    # FIX 5: Patch n_jobs=1 before serialisation so gunicorn sync workers never
+    # fork child processes during predict() at serving time.  RandomForest with
+    # n_jobs=-1 uses Python multiprocessing at predict time, which deadlocks
+    # inside a forked gunicorn worker and causes all /predict/random_forest/*
+    # routes to return HTTP 500.
+    model.n_jobs = 1
+    print("  [RF] n_jobs patched to 1 for safe gunicorn serving.")
 
     # ── 6. Conformal calibration ──────────────────────────────────────────────
     cal_preds_log = np.clip(model.predict(X_cal), 0, None)
@@ -216,6 +231,7 @@ def train_rf(horizon: int) -> dict:
     pi_upper = np.clip(preds_raw + margin, 0, 500)
 
     # ── 8. Save model to MongoDB (STORE 1) ────────────────────────────────────
+    # n_jobs is already 1 at this point — safe for gunicorn at load time.
     save_model_artifact(
         model_name="RandomForest",
         horizon=horizon,

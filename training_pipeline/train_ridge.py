@@ -6,8 +6,7 @@ Storage changes (v3):
 
 R² improvements (v3):
   R2 v3-1 — Added a second-pass ElasticNet model alongside Ridge, chosen via
-             CV.  ElasticNet handles collinear features better when many lag
-             columns are included, often outperforming pure Ridge on AQI.
+             held-out calibration set MAE.
 
   R2 v3-2 — Interaction feature list extended with additional meteorological
              cross-terms (boundary layer × PM2.5, humidity × wind, etc.).
@@ -16,8 +15,18 @@ R² improvements (v3):
 
 Previously retained fixes:
   R2 FIX 1 — RidgeCV uses TimeSeriesSplit (no leakage from k-fold).
-  R2 FIX 2 — Alpha grid 1e-4 to 1e4.
+  R2 FIX 2 — Alpha grid 1e-6 to 1e6 (was 1e-4..1e4 — all three horizons were
+             choosing alpha=10000, the old max, meaning the optimum was beyond
+             the grid).
   R2 FIX 3 — PolynomialFeatures for high-importance lag features.
+
+FIX 9 (NEW) — HELD-OUT VAL MAE FOR RIDGE vs ELASTICNET SELECTION
+  The previous _build_best_linear_model() compared in-sample training MAE to
+  decide between Ridge and ElasticNet.  ElasticNet almost always wins this
+  comparison because it has more regularisation parameters and overfits the
+  training set more cleanly — but it often generalises worse.  The comparison
+  is now done on the held-out calibration set (X_cal, y_cal_log) using raw-AQI
+  MAE (via expm1), giving a fair, leakage-free model selection criterion.
 """
 
 import warnings
@@ -107,15 +116,32 @@ def _add_interaction_terms(
 def _build_best_linear_model(
     X_train: pd.DataFrame,
     y_train: pd.Series,
+    X_val:   pd.DataFrame,
+    y_val:   pd.Series,
     tscv_final,
 ) -> tuple:
     """
-    R2 v3-1: Train both Ridge and ElasticNet; return whichever has lower CV error.
+    FIX 9: Train both Ridge and ElasticNet; choose via held-out calibration
+    set MAE (raw AQI scale via expm1), NOT in-sample training MAE.
+
+    The previous implementation compared in-sample training MAE, which
+    systematically favoured ElasticNet because it overfits the training data
+    more tightly.  Held-out val MAE gives a fair, leakage-free comparison
+    and consistently selects the better-generalising model.
+
+    Parameters
+    ──────────
+    X_train, y_train : training split (log-AQI target)
+    X_val,   y_val   : held-out calibration split (log-AQI target) — NOT touched
+                       during fitting, used only to evaluate which model generalises
+                       better before the final conformal margin is computed.
+    tscv_final       : TimeSeriesSplit CV object for internal alpha selection.
+
     Returns (pipeline, model_type_str).
     """
-    # FIX: alpha grid extended from 1e-4..1e4 to 1e-6..1e6 — all three horizons
-    # were choosing alpha=10000 (the old max), meaning the optimum was beyond the grid.
+    # R2 FIX 2: Extended alpha grid — previous [1e-4, 1e4] was hitting the ceiling
     alpha_grid = np.logspace(-6, 6, 60)
+
     ridge_pipe = Pipeline([
         ("scaler", StandardScaler()),
         ("ridge",  RidgeCV(alphas=alpha_grid, cv=tscv_final)),
@@ -126,21 +152,35 @@ def _build_best_linear_model(
         ("scaler", StandardScaler()),
         ("enet",   ElasticNetCV(
             l1_ratio=[0.1, 0.3, 0.5, 0.7, 0.9],
-            alphas=np.logspace(-6, 4, 40),  # FIX: extended range
+            alphas=np.logspace(-6, 4, 40),
             cv=tscv_final,
             max_iter=5000,
         )),
     ])
     enet_pipe.fit(X_train, y_train)
 
-    # Compare in-sample MSE on training data as a quick proxy (CV already done internally)
-    ridge_val = mean_absolute_error(y_train, ridge_pipe.predict(X_train))
-    enet_val  = mean_absolute_error(y_train, enet_pipe.predict(X_train))
+    # FIX 9: Evaluate on held-out validation set using raw-AQI scale MAE
+    # so that we compare generalisation error, not training error.
+    def _val_mae(pipe):
+        preds_log = pipe.predict(X_val)
+        preds_raw = np.clip(np.expm1(preds_log), 0, 500)
+        y_raw     = np.expm1(y_val.values)
+        return mean_absolute_error(y_raw, preds_raw)
 
-    if enet_val < ridge_val:
-        print(f"  [Ridge/ElasticNet] Chose ElasticNet (train MAE {enet_val:.4f} vs Ridge {ridge_val:.4f})")
+    ridge_val_mae = _val_mae(ridge_pipe)
+    enet_val_mae  = _val_mae(enet_pipe)
+
+    if enet_val_mae < ridge_val_mae:
+        print(
+            f"  [Ridge/ElasticNet] Chose ElasticNet "
+            f"(val MAE {enet_val_mae:.2f} vs Ridge {ridge_val_mae:.2f})"
+        )
         return enet_pipe, "ElasticNet"
-    print(f"  [Ridge/ElasticNet] Chose Ridge (train MAE {ridge_val:.4f} vs ElasticNet {enet_val:.4f})")
+
+    print(
+        f"  [Ridge/ElasticNet] Chose Ridge "
+        f"(val MAE {ridge_val_mae:.2f} vs ElasticNet {enet_val_mae:.2f})"
+    )
     return ridge_pipe, "Ridge"
 
 
@@ -180,7 +220,7 @@ def train_ridge(horizon: int) -> dict:
         fold_pipe = Pipeline([
             ("scaler", StandardScaler()),
             ("ridge",  RidgeCV(
-                alphas=np.logspace(-6, 6, 50),  # FIX: extended
+                alphas=np.logspace(-6, 6, 50),  # R2 FIX 2: extended
                 cv=TimeSeriesSplit(n_splits=3),
             )),
         ])
@@ -191,9 +231,16 @@ def train_ridge(horizon: int) -> dict:
             np.expm1(y_train_log.iloc[val_idx].values), fold_pred_raw
         ))
 
-    # ── 4. Final model fit: Ridge vs ElasticNet (R2 v3-1) ────────────────────
-    tscv_final = TimeSeriesSplit(n_splits=5, gap=min(horizon, 24))  # R2 v3-3
-    model, chosen_type = _build_best_linear_model(X_train, y_train_log, tscv_final)
+    # ── 4. Final model fit: Ridge vs ElasticNet (FIX 9) ──────────────────────
+    # R2 v3-3: n_splits raised 3→5 for more stable alpha selection.
+    # FIX 9: Pass X_cal / y_cal_log as the held-out comparison set so that
+    # model selection uses generalisation MAE, not in-sample training MAE.
+    tscv_final = TimeSeriesSplit(n_splits=5, gap=min(horizon, 24))
+    model, chosen_type = _build_best_linear_model(
+        X_train, y_train_log,
+        X_cal,   y_cal_log,    # held-out val for fair Ridge vs ElasticNet comparison
+        tscv_final,
+    )
 
     # Extract alpha for logging
     if chosen_type == "Ridge":
@@ -202,7 +249,7 @@ def train_ridge(horizon: int) -> dict:
     else:
         best_alpha = float(model.named_steps["enet"].alpha_)
         coef_arr   = model.named_steps["enet"].coef_
-    print(f"Optimal alpha ({chosen_type}): {best_alpha:.4f}")
+    print(f"Optimal alpha ({chosen_type}): {best_alpha:.6f}")
 
     # ── 5. Conformal calibration ──────────────────────────────────────────────
     cal_pred_raw = np.expm1(np.clip(model.predict(X_cal), 0, None))

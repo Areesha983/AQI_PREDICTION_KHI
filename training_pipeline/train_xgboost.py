@@ -22,6 +22,10 @@ Previously retained fixes:
   R2 FIX 2 — learning_rate 0.02.
   R2 FIX 3 — min_child_weight 5 (loosened from 8 for spike sensitivity).
   R2 FIX 4 — Sample weight cap 6× for AQI>200.
+
+FIX 8 (NEW) — n_estimators 800→600, early_stopping_rounds 60→80
+  Fewer max trees with more patience at lr=0.02 reduces overfitting and
+  lets early stopping find the true optimum before the tree count runs out.
 """
 
 import warnings
@@ -115,6 +119,8 @@ def _fit_residual_corrector(
     """
     R2 v3-2: Fit a shallow GBR on calibration residuals.
     This corrects systematic bias left by the main XGB model.
+    The corrector is stored in the artifact and applied at inference time
+    in app.py so that serving predictions match training-time accuracy.
     """
     residuals = y_cal_raw - cal_pred_raw
     corrector = GradientBoostingRegressor(
@@ -167,7 +173,7 @@ def train_xgboost(horizon: int) -> dict:
             learning_rate=0.03,
             subsample=0.8,
             colsample_bytree=0.85,  # R2 v3-3
-            min_child_weight=5,     # Matching structural fix
+            min_child_weight=5,
             reg_lambda=1.5,         # R2 v3-4
             reg_alpha=0.1,          # R2 v3-4
             random_state=42 + fold, n_jobs=-1, verbosity=0,
@@ -180,10 +186,10 @@ def train_xgboost(horizon: int) -> dict:
     print(f"CV RMSE (raw AQI): {np.mean(fold_rmse):.2f} ± {np.std(fold_rmse):.2f}")
 
     # ── 4. Clean Early-Stop Validation Isolation & Augmentation ──────────────
-    # CRITICAL LEAKAGE FIX: Separate the internal validation split strictly before performing 
-    # any row mutations or data augmentations on the active training subset.
+    # CRITICAL LEAKAGE FIX: Separate the internal validation split strictly before
+    # performing any row mutations or data augmentations on the active training subset.
     es_split = int(len(X_train) * 0.85)
-    X_clean_train_fold = X_train.iloc[:es_split]
+    X_clean_train_fold     = X_train.iloc[:es_split]
     y_clean_train_log_fold = y_train_log.iloc[:es_split]
     y_clean_train_raw_fold = y_train_raw.iloc[:es_split]
 
@@ -192,7 +198,7 @@ def train_xgboost(horizon: int) -> dict:
 
     # Augment ONLY the isolated training subset to protect validation slice integrity
     X_fold_aug, y_fold_aug = get_spike_augmented_train(
-        X_clean_train_fold, 
+        X_clean_train_fold,
         y_clean_train_log_fold,
         y_train_raw=y_clean_train_raw_fold,
         spike_threshold=150,
@@ -211,17 +217,20 @@ def train_xgboost(horizon: int) -> dict:
     sw_es[y_es_train_raw > 200] = 6.0
 
     # ── 6. Final XGBoost model ────────────────────────────────────────────────
+    # FIX 8: Reduced n_estimators 800→600, raised early_stopping_rounds 60→80.
+    # At lr=0.02, 800 trees often overshoots the optimum; 600 with more patience
+    # lets early stopping find the true best iteration and reduces overfitting.
     model = xgb.XGBRegressor(
-        n_estimators=800,
-        max_depth=7,            # R2 v3-3
+        n_estimators=600,           # FIX 8: was 800
+        max_depth=7,                # R2 v3-3
         learning_rate=0.02,
         subsample=0.8,
-        colsample_bytree=0.85,  # R2 v3-3
-        min_child_weight=5,     # FIX: reduced from 8 to capture complex peak splits
-        reg_lambda=1.2,         # FIX: reduced L2 shrinkage pressures
-        reg_alpha=0.05,         # FIX: reduced L1 penalty pressures
+        colsample_bytree=0.85,      # R2 v3-3
+        min_child_weight=5,         # reduced from 8 to capture complex peak splits
+        reg_lambda=1.2,             # reduced L2 shrinkage pressures
+        reg_alpha=0.05,             # reduced L1 penalty pressures
         tree_method="hist",
-        early_stopping_rounds=60,  # FIX: bumped 20->60 to let learning_rate=0.02 fully converge
+        early_stopping_rounds=80,   # FIX 8: was 60 — more patience at lr=0.02
         random_state=42, n_jobs=-1, verbosity=0,
     )
     print("Training final XGBoost model (early stopping on internal val set)…")
@@ -237,7 +246,9 @@ def train_xgboost(horizon: int) -> dict:
     cal_pred_log = np.clip(model.predict(X_cal), 0, None)
     cal_pred_raw = np.expm1(cal_pred_log)
 
-    # R2 v3-2: Fit residual corrector on calibration set residuals
+    # R2 v3-2: Fit residual corrector on calibration set residuals.
+    # This corrector is stored in the artifact and MUST be applied at inference
+    # time in app.py (predict route) to match training-time accuracy.
     corrector = _fit_residual_corrector(X_cal, y_cal_raw.values, cal_pred_raw)
     cal_pred_corrected = np.clip(cal_pred_raw + corrector.predict(X_cal), 0, 500)
 
@@ -253,12 +264,15 @@ def train_xgboost(horizon: int) -> dict:
     pi_upper = np.clip(preds_raw + margin, 0, 500)
 
     # ── 9. Save model to MongoDB via GridFS Module (STORE 1) ─────────────────
+    # IMPORTANT: Both model and corrector are stored together in the artifact.
+    # app.py's predict route reads artifact["corrector"] and applies it after
+    # expm1() — without this, inference predictions are systematically biased.
     save_model_artifact(
         model_name="XGBoost",
         horizon=horizon,
         artifact={
             "model":            model,
-            "corrector":        corrector,
+            "corrector":        corrector,   # GBR residual corrector — applied at inference
             "feature_names":    list(X_train.columns),
             "conformal_margin": float(margin),
             "use_log":          True,
@@ -336,6 +350,13 @@ def train_xgboost(horizon: int) -> dict:
         key=lambda x: x[1], reverse=True,
     )[:20]
     top_20 = [f for f, _ in top_20]
+
+    fig = plt.figure(figsize=(10, 8))
+    try:
+        shap.plots.beeswarm(shap_explanation, show=False)
+    except Exception:
+        shap.summary_plot(shap_explanation.values, X_sample, show=False)
+    save_shap_plot_png("XGBoost", horizon, fig, run_id)
 
     try:
         run_data_drift_monitoring(X_train, X_test, horizon, "XGB", top_20)
