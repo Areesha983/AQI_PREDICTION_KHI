@@ -313,17 +313,33 @@ def _d(features: dict, raw_key: str, lag_key: str, default: float) -> float:
 # ─── FIX-TIMESTAMP helper ─────────────────────────────────────────────────────
 _KARACHI_OFFSET = timedelta(hours=5)
 
-def _to_karachi_str(raw_dt) -> str | None:
+def _to_karachi_str(raw_dt, already_pkt: bool = False) -> str | None:
     """
-    FIX-TIMESTAMP: MongoDB documents store datetimes in UTC.  Convert to
-    Karachi local time (UTC+5) before displaying in the sidebar.
+    Convert a datetime value to a "YYYY-MM-DD HH:MM PKT" display string.
+
+    Two sources feed this function and they use DIFFERENT timezone conventions:
+
+    SOURCE A — realtime_observations (update_realtime.py)
+      Open-Meteo is called with &timezone=Asia%2FKarachi so every timestamp
+      in the API response is already PKT (UTC+5).  The datetime string is
+      stored as-is into MongoDB, e.g. "2026-06-07 16:00:00" meaning 16:00 PKT.
+      Pass already_pkt=True — NO offset should be added.
+
+    SOURCE B — processed_features (feature_engineering.py / feature_store.py)
+      The historical pipeline stores timestamps as UTC ISO strings.
+      Pass already_pkt=False (default) — add +5 h to convert to PKT.
+
+    Why the bug happened before:
+      The old code always added +5 h regardless of source.  For realtime data
+      (already PKT) this added a phantom extra 5 hours — "2026-06-07 23:00 PKT"
+      became "2026-06-08 04:00 PKT", showing the wrong date AND the wrong hour,
+      which then pulled the wrong temperature value (29 °C at 04:00 vs ~38 °C
+      at the actual afternoon time).
 
     Accepts:
-      - datetime objects (naive assumed UTC, or tz-aware)
-      - ISO strings like "2026-06-07T18:00:00" or "2026-06-07 18:00:00"
-      - Any other string → returned as-is (graceful fallback)
-
-    Returns a formatted "YYYY-MM-DD HH:MM PKT" string, or None if input is None.
+      - datetime objects (naive assumed UTC unless already_pkt=True)
+      - ISO/space-separated strings "2026-06-07T18:00:00" / "2026-06-07 18:00:00"
+      - Any other string → returned truncated as-is (graceful fallback)
     """
     if raw_dt is None:
         return None
@@ -343,10 +359,13 @@ def _to_karachi_str(raw_dt) -> str | None:
             # Unparseable — return truncated raw string rather than crashing
             return str(raw_dt)[:16]
 
-    # Treat naive datetimes as UTC (MongoDB default)
+    if already_pkt:
+        # Timestamp is already in Karachi local time — display directly
+        return dt.strftime("%Y-%m-%d %H:%M PKT")
+
+    # Timestamp is UTC — add +5 h to convert to PKT
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
-
     karachi_dt = dt.astimezone(timezone.utc) + _KARACHI_OFFSET
     return karachi_dt.strftime("%Y-%m-%d %H:%M PKT")
 
@@ -390,25 +409,34 @@ with st.sidebar:
     # stale values.  Now we always read from the (possibly fresh) cache result
     # and build a local dict used throughout this rerender.
     mongo_features: dict = {}
+    # Track whether the active timestamp is already PKT (realtime_observations)
+    # or UTC (processed_features) so _to_karachi_str applies the right conversion.
+    _dt_already_pkt: bool = False
 
     realtime_data, realtime_ok, realtime_err = _load_realtime_features(api_gateway)
 
     if realtime_ok:
         mongo_features.update(realtime_data)
         data_source_label = "🟢 Live  <span style='color:#334155;font-size:0.65rem;'>(realtime_observations)</span>"
-        mongo_active = True
-        mongo_error  = None
+        mongo_active    = True
+        mongo_error     = None
+        # Open-Meteo returns timestamps in Asia/Karachi when called with
+        # &timezone=Asia%2FKarachi — the datetime stored is already PKT.
+        _dt_already_pkt = True
     else:
         processed_data, processed_ok, processed_err = _load_processed_features(api_gateway)
         if processed_ok:
             mongo_features.update(processed_data)
             data_source_label = "🟡 Cached  <span style='color:#334155;font-size:0.65rem;'>(processed_features · T-1)</span>"
-            mongo_active = True
-            mongo_error  = realtime_err
+            mongo_active    = True
+            mongo_error     = realtime_err
+            # processed_features stores UTC timestamps — conversion needed.
+            _dt_already_pkt = False
         else:
             data_source_label = "🔴 Offline  <span style='color:#334155;font-size:0.65rem;'>(defaults)</span>"
-            mongo_active = False
-            mongo_error  = processed_err or realtime_err
+            mongo_active    = False
+            mongo_error     = processed_err or realtime_err
+            _dt_already_pkt = False
 
     # ── Resolve current sensor values ─────────────────────────────────────────
     sim_pm25     = _d(mongo_features, "pm25",               "pm25_lag_1",        75.0)
@@ -439,9 +467,11 @@ with st.sidebar:
     # ── Read-only sensor display ──────────────────────────────────────────────
     st.markdown("##### 📡 Current Conditions")
 
-    # FIX-TIMESTAMP: convert UTC timestamp → Karachi local time (UTC+5)
+    # FIX-TIMESTAMP: pass already_pkt so realtime timestamps (already PKT from
+    # Open-Meteo) are NOT double-shifted, while processed_features (UTC) are
+    # correctly converted by +5 h.
     _dt_raw = mongo_features.get("datetime") or mongo_features.get("timestamp")
-    _dt_local = _to_karachi_str(_dt_raw)
+    _dt_local = _to_karachi_str(_dt_raw, already_pkt=_dt_already_pkt)
     if _dt_local:
         st.caption(f"As of: {_dt_local}")
     else:
