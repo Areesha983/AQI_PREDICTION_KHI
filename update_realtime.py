@@ -38,6 +38,8 @@ from config import LATITUDE, LONGITUDE
 
 # ── How far back to look on each run ─────────────────────────────────────────
 LOOKBACK_HOURS = 6
+_API_TIMEOUT   = 45   # seconds — Open-Meteo can be slow; 15s was too tight
+_API_RETRIES   = 3    # attempts before giving up
 
 # ── TTL: 7 days in seconds ────────────────────────────────────────────────────
 TTL_SECONDS = 7 * 24 * 3600   # 604 800
@@ -57,22 +59,31 @@ def _fetch_realtime_air_quality(start_date: str, end_date: str) -> pd.DataFrame:
         "&hourly=pm2_5,pm10,carbon_monoxide,nitrogen_dioxide,sulphur_dioxide,ozone,dust,uv_index"
         "&timezone=Asia%2FKarachi"
     )
-    r = requests.get(url, timeout=15)
-    r.raise_for_status()
-    data = r.json()
-    if "hourly" not in data:
-        raise KeyError(f"Unexpected AQ response: {data}")
-
-    df = pd.DataFrame(data["hourly"])
-    df["datetime"] = pd.to_datetime(df["time"])
-    df = df.drop(columns=["time"])
-    df = df.rename(columns={
-        "pm2_5":           "pm25",
-        "carbon_monoxide": "co",
-        "nitrogen_dioxide":"no2",
-        "sulphur_dioxide": "so2",
-    })
-    return df
+    last_exc = None
+    for attempt in range(1, _API_RETRIES + 1):
+        try:
+            r = requests.get(url, timeout=_API_TIMEOUT)
+            r.raise_for_status()
+            data = r.json()
+            if "hourly" not in data:
+                raise KeyError(f"Unexpected AQ response: {data}")
+            df = pd.DataFrame(data["hourly"])
+            df["datetime"] = pd.to_datetime(df["time"])
+            df = df.drop(columns=["time"])
+            df = df.rename(columns={
+                "pm2_5":           "pm25",
+                "carbon_monoxide": "co",
+                "nitrogen_dioxide":"no2",
+                "sulphur_dioxide": "so2",
+            })
+            return df
+        except Exception as e:
+            last_exc = e
+            print(f"  [AQ fetch] Attempt {attempt}/{_API_RETRIES} failed: {e}")
+            if attempt < _API_RETRIES:
+                import time as _time
+                _time.sleep(10 * attempt)   # 10s, 20s back-off
+    raise last_exc
 
 
 def _fetch_realtime_weather(start_date: str, end_date: str) -> pd.DataFrame:
@@ -89,25 +100,31 @@ def _fetch_realtime_weather(start_date: str, end_date: str) -> pd.DataFrame:
         "&wind_speed_unit=kmh"
         "&timezone=Asia%2FKarachi"
     )
-    r = requests.get(url, timeout=15)
-
-    # Forecast API may not cover historical hours — fall back to archive
-    if r.status_code != 200:
-        archive_url = url.replace(
-            "https://forecast-api.open-meteo.com/v1/forecast",
-            "https://archive-api.open-meteo.com/v1/archive",
-        )
-        r = requests.get(archive_url, timeout=15)
-
-    r.raise_for_status()
-    data = r.json()
-    if "hourly" not in data:
-        raise KeyError(f"Unexpected weather response: {data}")
-
-    df = pd.DataFrame(data["hourly"])
-    df["datetime"] = pd.to_datetime(df["time"])
-    df = df.drop(columns=["time"])
-    return df
+    last_exc = None
+    for attempt in range(1, _API_RETRIES + 1):
+        try:
+            r = requests.get(url, timeout=_API_TIMEOUT)
+            if r.status_code != 200:
+                archive_url = url.replace(
+                    "https://forecast-api.open-meteo.com/v1/forecast",
+                    "https://archive-api.open-meteo.com/v1/archive",
+                )
+                r = requests.get(archive_url, timeout=_API_TIMEOUT)
+            r.raise_for_status()
+            data = r.json()
+            if "hourly" not in data:
+                raise KeyError(f"Unexpected weather response: {data}")
+            df = pd.DataFrame(data["hourly"])
+            df["datetime"] = pd.to_datetime(df["time"])
+            df = df.drop(columns=["time"])
+            return df
+        except Exception as e:
+            last_exc = e
+            print(f"  [WX fetch] Attempt {attempt}/{_API_RETRIES} failed: {e}")
+            if attempt < _API_RETRIES:
+                import time as _time
+                _time.sleep(10 * attempt)
+    raise last_exc
 
 
 # ─────────────────────────────────────────────────────────────────────────────
