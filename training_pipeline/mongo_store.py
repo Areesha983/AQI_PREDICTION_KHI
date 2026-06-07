@@ -17,6 +17,20 @@ Collections
   model_shap         — per-feature mean |SHAP| values
   model_shap_plots   — SHAP beeswarm PNG blobs stored via GridFS
   model_artifacts    — metadata doc + binary stored via GridFS (no size limit)
+
+BUG FIX — _gridfs_upsert prune scope (root-cause of missing RF artifacts)
+--------------------------------------------------------------------------
+Previously the prune query inside _gridfs_upsert filtered only on
+  { "metadata.model": ..., "metadata.horizon_h": ... }
+Both artifact_RandomForest_24h.pkl AND shap_plot_RandomForest_24h.png share
+those two metadata fields.  When save_shap_plot_png ran after save_model_artifact
+(steps 12 vs 8 in train_random_forest.py), the SHAP-plot upsert found BOTH
+files in the prune query, kept KEEP_N=1 (the freshly written SHAP plot at
+index 0), and deleted the artifact at index 1.  This is why all RF /predict
+routes returned HTTP 500 — load_model_artifact found no GridFS file.
+
+Fix: scope the prune query to the exact filename so each logical file-type
+only ever prunes its own prior versions.
 """
 
 from __future__ import annotations
@@ -68,33 +82,44 @@ def _run_id() -> str:
 
 def _gridfs_upsert(filename: str, data: bytes, metadata: dict) -> str:
     """
-    Store binary data in GridFS, then delete any older versions.
+    Store binary data in GridFS under `filename`, then prune older versions
+    of the SAME filename (keeping KEEP_N most recent).
 
-    FIX: Previously deleted BEFORE writing, which meant the current file was
-    deleted when KEEP_N=1 and one version already existed. Now we write first,
-    then prune anything older than the file we just wrote.
+    CRITICAL FIX: The prune query is now scoped to the exact `filename`.
+    Previously it filtered only on (metadata.model, metadata.horizon_h), which
+    caused artifact_RandomForest_24h.pkl to be deleted when
+    shap_plot_RandomForest_24h.png was written — they share the same model +
+    horizon_h metadata but are different logical files.  Scoping to filename
+    ensures each file-type only prunes its own prior versions.
+
+    Write-before-delete order is preserved: we write the new file first, then
+    prune, so a crash during pruning leaves the new file intact.
     """
     fs = _get_fs()
 
     # 1. Write the new file first — always succeeds before any deletion
     file_id = fs.put(data, filename=filename, metadata=metadata)
 
-    # 2. Now find all versions for this (model, horizon) — newest first
-    query = {
-        "metadata.model":     metadata.get("model"),
-        "metadata.horizon_h": metadata.get("horizon_h"),
-    }
-    existing_files = list(fs.find(query).sort("uploadDate", -1))
+    # 2. Find all GridFS versions of THIS EXACT filename, newest first.
+    #    Scoping to filename (not just model+horizon_h) prevents cross-file
+    #    deletions between artifacts and SHAP plots.
+    existing_files = list(fs.find({"filename": filename}).sort("uploadDate", -1))
 
-    # 3. Keep only the newest 1; delete the rest (they are all older than
-    #    the file we just wrote since GridFS appends by upload date)
+    # 3. Keep only the newest KEEP_N; delete the rest (all older than the
+    #    file we just wrote, since GridFS appends by upload date)
     KEEP_N = 1
     for old_file in existing_files[KEEP_N:]:
         try:
-            print(f"  [mongo_store] 🗑  Pruning old GridFS version: {old_file.filename} ({old_file._id})")
+            print(
+                f"  [mongo_store] 🗑  Pruning old GridFS version: "
+                f"{old_file.filename} ({old_file._id})"
+            )
             fs.delete(old_file._id)
         except Exception as e:
-            print(f"  [mongo_store] ⚠️  Failed to delete GridFS artifact {old_file._id}: {e}")
+            print(
+                f"  [mongo_store] ⚠️  Failed to delete GridFS artifact "
+                f"{old_file._id}: {e}"
+            )
 
     return str(file_id)
 
@@ -266,10 +291,11 @@ def save_shap_plot_png(model: str, horizon: int, fig, run_id: str | None = None)
     png_bytes = buf.read()
 
     rid      = run_id or _run_id()
-    filename = f"shap_plot_{model}_{horizon}h.png"   # Fix: was f"shap_plot_{model}_{model}_{horizon}h.png"
+    filename = f"shap_plot_{model}_{horizon}h.png"
     metadata = {
         "model":      model,
         "horizon_h":  horizon,
+        "file_type":  "shap_plot",   # extra discriminator for clarity
         "run_id":     rid,
         "updated_at": datetime.now(tz=timezone.utc).isoformat(),
     }
@@ -316,6 +342,7 @@ def save_model_artifact(
     metadata = {
         "model":      model_name,
         "horizon_h":  horizon,
+        "file_type":  "model_artifact",   # extra discriminator for clarity
         "run_id":     rid,
         "updated_at": datetime.now(tz=timezone.utc).isoformat(),
     }
@@ -378,21 +405,13 @@ def prune_old_artifacts(model_name: str, horizon: int, keep_last: int = 1) -> in
     Removes older GridFS model artifacts for a given (model_name, horizon) pair,
     keeping only the `keep_last` most recent versions.
 
+    Scoped to the exact artifact filename so SHAP plots are never touched.
+
     Returns the number of files deleted.
-
-    NOTE: The snippet in the Atlas dashboard suggestion referenced bare `db` and
-    `fs` globals — those don't exist in this module.  This version correctly uses
-    _get_fs() so it is safe to call from anywhere.
-
-    Usage:
-        from mongo_store import prune_old_artifacts
-        prune_old_artifacts("RandomForest", 24)        # keep only the latest
-        prune_old_artifacts("XGBoost", 48, keep_last=2)
     """
     fs = _get_fs()
-    cursor = fs.find(
-        {"metadata.model": model_name, "metadata.horizon_h": horizon}
-    ).sort("uploadDate", -1)
+    filename = f"artifact_{model_name}_{horizon}h.pkl"
+    cursor = fs.find({"filename": filename}).sort("uploadDate", -1)
 
     all_files = list(cursor)
     to_delete = all_files[keep_last:]
@@ -413,8 +432,8 @@ def prune_all_artifacts(keep_last: int = 1) -> None:
     (model, horizon) combination in one call.
 
     Run this once from a Python shell to immediately recover Atlas M0 storage
-    after a write-block, then rely on _gridfs_upsert's single-version
-    enforcement going forward:
+    after a write-block, then rely on _gridfs_upsert's filename-scoped
+    single-version enforcement going forward:
 
         python -c "from mongo_store import prune_all_artifacts; prune_all_artifacts()"
     """
