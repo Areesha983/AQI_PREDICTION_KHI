@@ -433,6 +433,7 @@ def index():
             "debug_artifacts":   "/debug/artifacts",
             "debug_features":    "/debug/features_raw",
             "debug_metrics":     "/debug/metrics_raw",
+            "latest_realtime":   "/latest_realtime",
         },
     }), 200
 
@@ -462,6 +463,44 @@ def latest_features():
         "temperature_lag_1", "humidity_lag_1", "wind_speed_lag_1",
     ]
     return jsonify({k: doc.get(k) for k in safe_keys if k in doc}), 200
+
+
+@app.route("/latest_realtime", methods=["GET"])
+def latest_realtime():
+    """
+    Returns the single most recent document from `realtime_observations`.
+    Written by update_realtime.py every hour with today's partial data.
+
+    Falls back to a 503 if the collection is empty (e.g. update_realtime.py
+    hasn't run yet), so the Streamlit dashboard can gracefully fall back to
+    /latest_features instead.
+
+    Exposed columns are raw sensor values (pm25, pm10, temperature_2m, etc.)
+    matching exactly what Open-Meteo returns, so the dashboard _d() helper
+    can read them by their raw names before the feature engineering lag step.
+    """
+    try:
+        client = _mongo_client()
+        db     = client[DB_NAME]
+        col    = db["realtime_observations"]
+        # Sort by datetime string — ISO-sortable so lexicographic == chronological
+        doc = col.find_one({}, sort=[("datetime", -1)])
+        client.close()
+
+        if doc is None:
+            return jsonify({
+                "error": "realtime_observations is empty. update_realtime.py has not run yet."
+            }), 503
+
+        doc.pop("_id", None)
+        # Expose raw sensor fields + datetime; drop the TTL anchor (fetched_at)
+        # to avoid sending a non-JSON-serialisable datetime object.
+        doc.pop("fetched_at", None)
+
+        return jsonify(doc), 200
+
+    except PyMongoError as e:
+        return jsonify({"error": f"realtime_observations query failed: {str(e)}"}), 500
 
 
 @app.route("/predict/<string:model_type>/<int:horizon>", methods=["POST"])

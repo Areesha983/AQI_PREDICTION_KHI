@@ -10,7 +10,7 @@ on:
 jobs:
   run-feature-pipeline:
     runs-on: ubuntu-latest
-    
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -19,17 +19,28 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11' # 3.11 required for X | None union type hint syntax in load_data.py
-          cache: 'pip'          # Enables automated caching to speed up subsequent workflow runs
+          cache: 'pip'           # Enables automated caching to speed up subsequent workflow runs
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run Feature Pipeline
+      # ── SLOW PATH: historical catch-up + feature engineering ─────────────────
+      # Writes to `processed_features` (training data).
+      # Uses get_end_date() → yesterday, so rolling averages are always complete.
+      - name: Run Feature Pipeline (Historical / Training Path)
         env:
-          # Securely injects your GitHub secret into the environment variable expected by load_data.py
           MONGODB_URI: ${{ secrets.MONGO_CONNECTION_STRING }}
         run: |
-          # Calls the entry point script to update the cloud MongoDB feature store
           python run_feature_pipeline.py
+
+      # ── FAST PATH: real-time dashboard update ────────────────────────────────
+      # Fetches last ~6 hours (including today's partial data) and writes to
+      # `realtime_observations` (TTL-indexed, self-cleaning, never touches
+      # processed_features so training data is 100% safe).
+      - name: Run Realtime Update (Dashboard Path)
+        env:
+          MONGODB_URI: ${{ secrets.MONGO_CONNECTION_STRING }}
+        run: |
+          python update_realtime.py

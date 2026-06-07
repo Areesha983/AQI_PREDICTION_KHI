@@ -13,6 +13,20 @@ FIX-SHAP    The /shap/<model>/<horizon> endpoint already exists in api/app.py
             (added in that file's latest revision).  This file needed no change
             on the fetch side; the info-box and code-snippet fallback remain as
             a graceful degradation if the collection is still empty.
+
+TWO-SPEED DASHBOARD UPDATE (new)
+─────────────────────────────────
+The sidebar now shows a "Live" badge when data comes from `realtime_observations`
+(written by update_realtime.py every hour, includes today's partial data) and a
+"Cached" badge when falling back to the latest record in `processed_features`
+(yesterday's finalised data, used by training).
+
+Fetch priority:
+  1. /latest_realtime  → realtime_observations  (most recent, ~1-2 h lag from API)
+  2. /latest_features  → processed_features     (yesterday, always complete)
+
+If both fail, the UI falls back to hard-coded defaults and shows a red badge.
+No training data is ever written or modified by this file.
 """
 
 import time
@@ -230,18 +244,37 @@ def _api_post(gateway: str, path: str, payload: dict, timeout: tuple = (15, 60))
     return None
 
 
-# ─── Latest features (via Flask proxy) ───────────────────────────────────────
-@st.cache_data(ttl=30)
-def _load_mongo_features(gateway: str) -> tuple[dict, bool, str | None]:
+# ─── Feature fetchers ─────────────────────────────────────────────────────────
+
+# TWO-SPEED: try realtime_observations first (via /latest_realtime),
+# fall back to processed_features (via /latest_features).
+
+@st.cache_data(ttl=60)   # 60-second cache — realtime refreshes every hour anyway
+def _load_realtime_features(gateway: str) -> tuple[dict, bool, str | None]:
+    """Fetches from realtime_observations (today's partial data)."""
+    r = _api_get(gateway, "/latest_realtime", timeout=(10, 20))
+    if r is None:
+        return {}, False, f"Cannot reach Flask API at {gateway}."
+    if r.status_code == 200:
+        data = r.json()
+        if data and isinstance(data, dict) and "error" not in data:
+            return data, True, None
+        return {}, False, data.get("error", "Empty realtime document.")
+    return {}, False, f"/latest_realtime returned HTTP {r.status_code}."
+
+
+@st.cache_data(ttl=300)  # 5-minute cache for the slower historical path
+def _load_processed_features(gateway: str) -> tuple[dict, bool, str | None]:
+    """Fetches from processed_features (yesterday's finalised data)."""
     r = _api_get(gateway, "/latest_features", timeout=(10, 20))
     if r is None:
         return {}, False, f"Cannot reach Flask API at {gateway}."
     if r.status_code == 200:
         data = r.json()
-        if data and isinstance(data, dict):
+        if data and isinstance(data, dict) and "error" not in data:
             return data, True, None
-        return {}, False, "API returned empty feature document."
-    return {}, False, f"Flask /latest_features returned HTTP {r.status_code}."
+        return {}, False, data.get("error", "Empty feature document.")
+    return {}, False, f"/latest_features returned HTTP {r.status_code}."
 
 
 # ─── Module-level feature dict + helper ──────────────────────────────────────
@@ -293,20 +326,93 @@ with st.sidebar:
 
     st.markdown("---")
 
-    # ── Fetch live features from MongoDB (via Flask) ──────────────────────────
-    _fetched, mongo_active, mongo_error = _load_mongo_features(api_gateway)
-    mongo_features.update(_fetched)
+    # ── TWO-SPEED FETCH: realtime first, processed fallback ───────────────────
+    realtime_data, realtime_ok, realtime_err = _load_realtime_features(api_gateway)
+
+    if realtime_ok:
+        mongo_features.update(realtime_data)
+        data_source_label = "🟢 Live  <span style='color:#334155;font-size:0.65rem;'>(realtime_observations)</span>"
+        mongo_active = True
+        mongo_error  = None
+    else:
+        # Fall back to processed_features
+        processed_data, processed_ok, processed_err = _load_processed_features(api_gateway)
+        if processed_ok:
+            mongo_features.update(processed_data)
+            data_source_label = "🟡 Cached  <span style='color:#334155;font-size:0.65rem;'>(processed_features · T-1)</span>"
+            mongo_active = True
+            mongo_error  = realtime_err   # show why realtime failed
+        else:
+            data_source_label = "🔴 Offline  <span style='color:#334155;font-size:0.65rem;'>(defaults)</span>"
+            mongo_active = False
+            mongo_error  = processed_err or realtime_err
 
     # ── Resolve current sensor values (live or defaults) ─────────────────────
-    sim_pm25     = _d("pm25",        "pm25_lag_1",        75.0)
-    sim_pm10     = _d("pm10",        "pm10_lag_1",       140.0)
-    sim_temp     = _d("temperature", "temperature_lag_1",  32.0)
-    sim_humidity = _d("humidity",    "humidity_lag_1",     65.0)
-    sim_wind     = _d("wind_speed",  "wind_speed_lag_1",   12.0)
+    # realtime_observations stores raw column names (pm25, temperature_2m, etc.)
+    # processed_features stores lag-1 names (pm25_lag_1, temperature_lag_1, etc.)
+    # _d() tries both so it works whichever collection responded.
+    sim_pm25     = _d("pm25",             "pm25_lag_1",        75.0)
+    sim_pm10     = _d("pm10",             "pm10_lag_1",       140.0)
+    sim_temp     = _d("temperature_2m",   "temperature_lag_1",  32.0)
+    sim_humidity = _d("relative_humidity_2m", "humidity_lag_1", 65.0)
+    sim_wind     = _d("wind_speed_10m",   "wind_speed_lag_1",   12.0)
+
+    # ── Compute current AQI from PM2.5 ────────────────────────────────────────
+    def _pm25_to_aqi(pm25: float) -> int:
+        bps = [
+            (0.0,   12.0,  0,   50),
+            (12.1,  35.4,  51,  100),
+            (35.5,  55.4,  101, 150),
+            (55.5,  150.4, 151, 200),
+            (150.5, 250.4, 201, 300),
+            (250.5, 350.4, 301, 400),
+            (350.5, 500.4, 401, 500),
+        ]
+        for c_lo, c_hi, a_lo, a_hi in bps:
+            if c_lo <= pm25 <= c_hi:
+                return round(((a_hi - a_lo) / (c_hi - c_lo)) * (pm25 - c_lo) + a_lo)
+        return 500
+
+    sim_aqi  = _pm25_to_aqi(sim_pm25)
+    aqi_tier = get_epa_tier_details(sim_aqi)
 
     # ── Read-only sensor display ──────────────────────────────────────────────
     st.markdown("##### 📡 Current Conditions")
-    st.caption("Live values from MongoDB feature store · read-only")
+
+    # Show the datetime of the data if available
+    _dt_raw = mongo_features.get("datetime") or mongo_features.get("timestamp")
+    if _dt_raw:
+        st.caption(f"As of: {str(_dt_raw)[:16]}")
+    else:
+        st.caption("Live values from feature store · read-only")
+
+    # AQI highlight card — shown before the individual sensor rows
+    st.markdown(
+        f"""<div style="
+                background: {aqi_tier['bg']};
+                border: 1px solid {aqi_tier['color']}44;
+                border-left: 3px solid {aqi_tier['color']};
+                border-radius: 10px;
+                padding: 12px 14px;
+                margin-bottom: 10px;">
+            <div class="sensor-label">Current AQI</div>
+            <div style="display:flex; align-items:baseline; gap:8px; margin-top:3px;">
+                <span style="font-size:2rem; font-weight:700; color:{aqi_tier['color']};
+                             font-family:'JetBrains Mono',monospace; line-height:1;">
+                    {sim_aqi}
+                </span>
+                <span style="font-size:0.72rem; color:{aqi_tier['color']}; opacity:0.85;
+                             font-family:'JetBrains Mono',monospace;">
+                    {aqi_tier['label']}
+                </span>
+            </div>
+            <div style="font-size:0.65rem; color:#64748b; margin-top:5px;
+                        font-family:'JetBrains Mono',monospace; line-height:1.4;">
+                {aqi_tier['advice']}
+            </div>
+        </div>""",
+        unsafe_allow_html=True,
+    )
 
     _sensor_rows = [
         ("PM2.5",       sim_pm25,     "μg/m³"),
@@ -325,14 +431,11 @@ with st.sidebar:
         )
 
     st.markdown("---")
-    db_dot = "🟢" if mongo_active else "🔴"
     st.markdown(
-        f"""<div style='font-size:0.72rem; color:#475569;'>
-                {db_dot} {'Live feature store' if mongo_active else 'Fallback defaults'}
-            </div>""",
+        f"""<div style='font-size:0.72rem; color:#475569;'>{data_source_label}</div>""",
         unsafe_allow_html=True,
     )
-    if not mongo_active and mongo_error:
+    if mongo_error:
         st.caption(f"⚠️ {mongo_error}")
 
 
@@ -752,7 +855,6 @@ if shap_data:
                            tickfont=dict(color="#cbd5e1", size=10))
     st.plotly_chart(fig_shap, use_container_width=True, config={"displayModeBar": False})
 else:
-    # Graceful degradation — shown only when model_shap collection is still empty
     st.info(
         "SHAP data not yet available.  The `/shap/<model>/<horizon>` route already exists "
         "in `api/app.py`.  Once the training pipeline runs and writes to `model_shap` in "
