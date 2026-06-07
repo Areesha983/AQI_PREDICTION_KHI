@@ -474,11 +474,17 @@ def build_features(df_raw: pd.DataFrame) -> pd.DataFrame:
 
     df = pd.concat([df, pd.DataFrame(met_cols, index=df.index)], axis=1)
 
-    # ── STEP 15: WARM-UP ROW FILTERING ───────────────────────────────────────
-    required_non_null = ["aqi_same_hour_30days_ago", "target_aqi_72h"]
+    # ── STEP 15: WARM-UP ROW FILTERING ─────────────────────────────────────────────────
+    # Only drop rows missing the 30-day lookback anchor (genuine warm-up rows
+    # with no usable context). Do NOT filter on target_aqi_72h -- that column
+    # is NaN for the trailing 72 rows of every batch (no 72h future yet), but
+    # those rows are perfectly valid observations for the dashboard sidebar and
+    # for short-horizon training (12h/24h). Dropping them caused processed_features
+    # to always lag 3 days behind the true latest data.
+    required_non_null = ["aqi_same_hour_30days_ago"]
     before = len(df)
     df = df.dropna(subset=required_non_null).reset_index(drop=True)
-    print(f" -> Dropped {before - len(df):,} warm-up rows. {len(df):,} rows remaining.")
+    print(f" -> Dropped {before - len(df):,} warm-up rows (missing 30-day anchor). {len(df):,} rows remaining.")
 
     assert df["datetime"].is_monotonic_increasing, "CRITICAL: Temporal order broken."
 
