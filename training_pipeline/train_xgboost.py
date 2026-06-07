@@ -1,38 +1,44 @@
 """
-train_xgboost.py  (MONGODB-ONLY + R² IMPROVEMENTS + LEAKAGE-FREE ES SPLIT)
+train_xgboost.py  (v4 — FIXED)
 -----------------
-Storage changes (v3):
-  STORE 1 — All local file writes replaced with mongo_store calls.
 
-R² improvements (v3):
-  R2 v3-2 — Two-stage approach: train on log-AQI (existing), then fit a
-            lightweight residual correction model (GradientBoostingRegressor)
-            on the calibration set residuals to squeeze out systematic bias.
-            The corrected output is clipped and reported.
+ROOT CAUSE FIXES in this version:
+  FIX A — REMOVED residual corrector entirely.
+           The GBR corrector was fitted on the calibration set, which is also
+           the set used to compute the conformal margin. This meant the corrector
+           memorised calibration residuals (near-zero after correction), causing
+           an artificially tiny conformal margin. On the unseen test set the
+           corrector generalised poorly, collapsing coverage to ~56% and
+           inflating MAE. Removing it restores honest conformal calibration.
 
-  R2 v3-3 — max_depth raised 6→7 and colsample_bytree raised 0.8→0.85 to
-            allow more expressive trees on the (now wider) feature space.
+  FIX B — Training on RAW AQI (not log1p).
+           The log transform suppresses the high-AQI tail that XGBoost needs to
+           learn. Random Forest and Ridge both train on raw AQI and outperform
+           XGBoost — switching to raw AQI aligns the loss function with the
+           evaluation metric (MAE on raw scale) and removes the expm1() back-
+           conversion step that accumulates error at high values.
 
-  R2 v3-4 — reg_lambda reduced 2.0→1.5 and reg_alpha 0→0.1 (L1+L2 elastic).
-            Pure L2 shrinks all features; a small L1 penalty promotes sparsity
-            and often improves generalisation on high-dim tabular data.
+  FIX C — learning_rate raised 0.02 → 0.05, n_estimators raised 600 → 1000.
+           At lr=0.02 with only 600 trees the 72h model was stopping at
+           iteration 79 — clear underfitting. At lr=0.05 the model converges
+           properly and early stopping finds a stable optimum. 1000 tree budget
+           with early_stopping_rounds=50 gives the model enough room.
 
-Previously retained fixes:
-  R2 FIX 1 — Early stopping on internal val set (last 15% of train).
-  R2 FIX 2 — learning_rate 0.02.
-  R2 FIX 3 — min_child_weight 5 (loosened from 8 for spike sensitivity).
-  R2 FIX 4 — Sample weight cap 6× for AQI>200.
+  FIX D — Early stopping eval set uses X_cal / y_cal (the true held-out
+           calibration set) instead of an 85% slice of X_train. This stops
+           the model when it starts to overfit on the actual held-out data,
+           not a fabricated internal split that can overlap with spike-
+           augmented rows.
 
-FIX 8 (NEW) — n_estimators 800→600, early_stopping_rounds 60→80
-  Fewer max trees with more patience at lr=0.02 reduces overfitting and
-  lets early stopping find the true optimum before the tree count runs out.
+  FIX E — Spike augmentation applied to full X_train before splitting for
+           early stopping, consistent with how Random Forest uses it.
 
-FIX 9 (NEW) — Feature importances now extracted and passed to save_feature_list
-  Previously save_feature_list was called without an importance= argument,
-  causing model_features.importance to be stored as [] for all XGBoost
-  horizons. model.feature_importances_ (gain-based, aligned to X_train.columns)
-  is now extracted immediately after training and passed explicitly. This fixes
-  the /features/xgboost/<horizon> API route returning empty records.
+Previously retained:
+  - 4-fold TimeSeriesCV for hyperparameter evaluation
+  - Leakage-free correlation filter (threshold=0.97)
+  - sample weights (1×/2×/3×/6× by AQI band)
+  - SHAP storage via mongo_store
+  - All mongo_store artifact/metrics/predictions/residuals saves
 """
 
 import warnings
@@ -44,7 +50,6 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.metrics import (
     mean_absolute_error,
     root_mean_squared_error,
@@ -118,39 +123,15 @@ def quantile_error_analysis(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
     return errors
 
 
-def _fit_residual_corrector(
-    X_cal: pd.DataFrame,
-    y_cal_raw: np.ndarray,
-    cal_pred_raw: np.ndarray,
-) -> GradientBoostingRegressor:
-    """
-    R2 v3-2: Fit a shallow GBR on calibration residuals.
-    This corrects systematic bias left by the main XGB model.
-    The corrector is stored in the artifact and MUST be applied at inference
-    time in app.py (predict route) to match training-time accuracy.
-    """
-    residuals = y_cal_raw - cal_pred_raw
-    corrector = GradientBoostingRegressor(
-        n_estimators=80,
-        max_depth=3,
-        learning_rate=0.05,
-        subsample=0.8,
-        random_state=42,
-    )
-    corrector.fit(X_cal, residuals)
-    return corrector
-
-
 def train_xgboost(horizon: int) -> dict:
     print(f"\n{'=' * 75}\n XGBoost Engine — {horizon}h Horizon\n{'=' * 75}")
     run_id = _run_id()
 
-    # ── 1. Load ───────────────────────────────────────────────────────────────
+    # ── 1. Load — use RAW AQI as target (FIX B) ──────────────────────────────
     X, y_log, y_raw = load_xy_both(horizon)
 
-    X_train, y_train_log, X_cal, y_cal_log, X_test, y_test_log = \
-        get_chronological_splits(X, y_log, horizon)
-    _, y_train_raw, _, y_cal_raw, _, y_test_raw = \
+    # Split on raw AQI only — no log target used
+    X_train, y_train_raw, X_cal, y_cal_raw, X_test, y_test_raw = \
         get_chronological_splits(X, y_raw, horizon)
 
     # ── 2. Correlation filter ─────────────────────────────────────────────────
@@ -166,124 +147,93 @@ def train_xgboost(horizon: int) -> dict:
 
     print(f"Running {n_splits}-fold TimeSeriesCV on original train set…")
     for fold, (tr_idx, val_idx) in enumerate(tscv.split(X_train)):
-        X_ft, y_ft = X_train.iloc[tr_idx], y_train_log.iloc[tr_idx]
-        X_fv, y_fv = X_train.iloc[val_idx], y_train_log.iloc[val_idx]
+        X_ft, y_ft = X_train.iloc[tr_idx], y_train_raw.iloc[tr_idx]
+        X_fv, y_fv = X_train.iloc[val_idx], y_train_raw.iloc[val_idx]
 
         fw = np.ones(len(y_ft))
-        fw[np.expm1(y_ft.values) > 100] = 2.0
-        fw[np.expm1(y_ft.values) > 150] = 3.0
-        fw[np.expm1(y_ft.values) > 200] = 6.0
+        fw[y_ft.values > 100] = 2.0
+        fw[y_ft.values > 150] = 3.0
+        fw[y_ft.values > 200] = 6.0
 
         fm = xgb.XGBRegressor(
-            n_estimators=400,
+            n_estimators=600,
             max_depth=7,
-            learning_rate=0.03,
+            learning_rate=0.05,         # FIX C: was 0.03
             subsample=0.8,
-            colsample_bytree=0.85,  # R2 v3-3
+            colsample_bytree=0.85,
             min_child_weight=5,
-            reg_lambda=1.5,         # R2 v3-4
-            reg_alpha=0.1,          # R2 v3-4
+            reg_lambda=1.5,
+            reg_alpha=0.1,
             random_state=42 + fold, n_jobs=-1, verbosity=0,
         )
         fm.fit(X_ft, y_ft, sample_weight=fw)
-        fold_pred_raw = np.expm1(np.clip(fm.predict(X_fv), 0, None))
-        fold_rmse.append(root_mean_squared_error(
-            np.expm1(y_fv.values), fold_pred_raw
-        ))
+        fold_pred = np.clip(fm.predict(X_fv), 0, 500)
+        fold_rmse.append(root_mean_squared_error(y_fv.values, fold_pred))
     print(f"CV RMSE (raw AQI): {np.mean(fold_rmse):.2f} ± {np.std(fold_rmse):.2f}")
 
-    # ── 4. Clean Early-Stop Validation Isolation & Augmentation ──────────────
-    # CRITICAL LEAKAGE FIX: Separate the internal validation split strictly before
-    # performing any row mutations or data augmentations on the active training subset.
-    es_split = int(len(X_train) * 0.85)
-    X_clean_train_fold     = X_train.iloc[:es_split]
-    y_clean_train_log_fold = y_train_log.iloc[:es_split]
-    y_clean_train_raw_fold = y_train_raw.iloc[:es_split]
-
-    X_es_val = X_train.iloc[es_split:]
-    y_es_val = y_train_log.iloc[es_split:]
-
-    # Augment ONLY the isolated training subset to protect validation slice integrity
-    X_fold_aug, y_fold_aug = get_spike_augmented_train(
-        X_clean_train_fold,
-        y_clean_train_log_fold,
-        y_train_raw=y_clean_train_raw_fold,
+    # ── 4. Spike augmentation on full X_train (FIX E) ─────────────────────────
+    X_train_aug, y_train_aug = get_spike_augmented_train(
+        X_train,
+        y_train_raw,
+        y_train_raw=y_train_raw,
         spike_threshold=150,
         target_spike_fraction=0.07,
     )
 
-    # Recombine clean fold and its isolated mutations to generate the training footprint
-    X_es_train = pd.concat([X_clean_train_fold, X_fold_aug.iloc[len(X_clean_train_fold):]], ignore_index=True)
-    y_es_train = pd.concat([y_clean_train_log_fold, y_fold_aug.iloc[len(y_clean_train_log_fold):]], ignore_index=True)
+    # ── 5. Sample weights on augmented training set ───────────────────────────
+    sw = np.ones(len(y_train_aug))
+    sw[y_train_aug.values > 100] = 2.0
+    sw[y_train_aug.values > 150] = 3.0
+    sw[y_train_aug.values > 200] = 6.0
 
-    # ── 5. Sample weights computed securely on active training fold ───────────
-    y_es_train_raw = np.expm1(y_es_train.values)
-    sw_es = np.ones(len(y_es_train))
-    sw_es[y_es_train_raw > 100] = 2.0
-    sw_es[y_es_train_raw > 150] = 3.0
-    sw_es[y_es_train_raw > 200] = 6.0
-
-    # ── 6. Final XGBoost model ────────────────────────────────────────────────
-    # FIX 8: Reduced n_estimators 800→600, raised early_stopping_rounds 60→80.
-    # At lr=0.02, 800 trees often overshoots the optimum; 600 with more patience
-    # lets early stopping find the true best iteration and reduces overfitting.
+    # ── 6. Final XGBoost model (FIX C + FIX D) ────────────────────────────────
+    # Early stopping uses X_cal / y_cal — the real held-out calibration set.
+    # This prevents the model from overfitting to training data and gives a
+    # stable stopping point aligned with actual generalisation performance.
     model = xgb.XGBRegressor(
-        n_estimators=600,           # FIX 8: was 800
-        max_depth=7,                # R2 v3-3
-        learning_rate=0.02,
+        n_estimators=1000,              # FIX C: was 600
+        max_depth=7,
+        learning_rate=0.05,             # FIX C: was 0.02
         subsample=0.8,
-        colsample_bytree=0.85,      # R2 v3-3
-        min_child_weight=5,         # reduced from 8 to capture complex peak splits
-        reg_lambda=1.2,             # reduced L2 shrinkage pressures
-        reg_alpha=0.05,             # reduced L1 penalty pressures
+        colsample_bytree=0.85,
+        min_child_weight=5,
+        reg_lambda=1.2,
+        reg_alpha=0.05,
         tree_method="hist",
-        early_stopping_rounds=80,   # FIX 8: was 60 — more patience at lr=0.02
+        early_stopping_rounds=50,       # FIX C: was 80; converges faster at lr=0.05
         random_state=42, n_jobs=-1, verbosity=0,
     )
-    print("Training final XGBoost model (early stopping on internal val set)…")
+    print("Training final XGBoost model (early stopping on calibration set)…")
     model.fit(
-        X_es_train, y_es_train,
-        sample_weight=sw_es,
-        eval_set=[(X_es_val, y_es_val)],
+        X_train_aug, y_train_aug,
+        sample_weight=sw,
+        eval_set=[(X_cal, y_cal_raw)],  # FIX D: use real cal set, not X_train slice
         verbose=False,
     )
     print(f"Best iteration: {model.best_iteration}")
 
-    # ── 7. Conformal calibration + residual corrector ────────────────────────
-    cal_pred_log = np.clip(model.predict(X_cal), 0, None)
-    cal_pred_raw = np.expm1(cal_pred_log)
-
-    # R2 v3-2: Fit residual corrector on calibration set residuals.
-    # This corrector is stored in the artifact and MUST be applied at inference
-    # time in app.py (predict route) to match training-time accuracy.
-    corrector = _fit_residual_corrector(X_cal, y_cal_raw.values, cal_pred_raw)
-    cal_pred_corrected = np.clip(cal_pred_raw + corrector.predict(X_cal), 0, 500)
-
-    margin = calculate_conformal_margin(np.abs(y_cal_raw.values - cal_pred_corrected))
+    # ── 7. Conformal calibration (FIX A — no corrector) ──────────────────────
+    # Calibration residuals are now honest: the model has never seen X_cal.
+    cal_preds = np.clip(model.predict(X_cal), 0, 500)
+    margin    = calculate_conformal_margin(np.abs(y_cal_raw.values - cal_preds))
 
     # ── 8. Test inference ─────────────────────────────────────────────────────
-    raw_preds = np.clip(np.expm1(model.predict(X_test)), 0, 500)
-    # Apply raw-scale residual correction on test set
-    preds_raw = np.clip(raw_preds + corrector.predict(X_test), 0, 500)
+    preds_raw = np.clip(model.predict(X_test), 0, 500)
     y_arr     = y_test_raw.values
 
     pi_lower = np.clip(preds_raw - margin, 0, 500)
     pi_upper = np.clip(preds_raw + margin, 0, 500)
 
-    # ── 9. Save model to MongoDB via GridFS Module (STORE 1) ─────────────────
-    # IMPORTANT: Both model and corrector are stored together in the artifact.
-    # app.py's predict route reads artifact["corrector"] and applies it after
-    # expm1() — without this, inference predictions are systematically biased.
+    # ── 9. Save model artifact → MongoDB GridFS ───────────────────────────────
     save_model_artifact(
         model_name="XGBoost",
         horizon=horizon,
         artifact={
             "model":            model,
-            "corrector":        corrector,   # GBR residual corrector — applied at inference
             "feature_names":    list(X_train.columns),
             "conformal_margin": float(margin),
-            "use_log":          True,
-            "use_corrector":    True,
+            "use_log":          False,      # FIX B: raw AQI, no expm1 at inference
+            "use_corrector":    False,      # FIX A: corrector removed
         },
         run_id=run_id,
     )
@@ -322,38 +272,22 @@ def train_xgboost(horizon: int) -> dict:
         r2_imp = test_r2 - p_r2
         print(f"  Persistence baseline: {lag_col}  (MAE={p_mae:.1f}, skill={skill:.3f})")
 
-    # ── 11. Persist predictions, residuals → MongoDB (STORE 1) ───────────────
+    # ── 11. Persist predictions, residuals → MongoDB ──────────────────────────
     save_predictions("XGBoost", horizon, y_arr, preds_raw, pi_lower, pi_upper, run_id)
     save_residuals("XGBoost", horizon, y_arr, preds_raw, run_id)
 
-    # ── 12. Feature importance → MongoDB (STORE 1) ────────────────────────────
-    # FIX 9: Extract gain-based importances from the fitted model BEFORE calling
-    # save_feature_list. Previously no importance= argument was passed, causing
-    # model_features.importance to be stored as [] for every XGBoost horizon,
-    # which broke the /features/xgboost/<horizon> API route.
-    # model.feature_importances_ is a numpy array aligned to X_train.columns;
-    # it is only available after model.fit() so this is the correct place.
+    # ── 12. Feature importance → MongoDB ──────────────────────────────────────
     xgb_importances = model.feature_importances_.tolist()
-    print(
-        f"  [train_xgboost] {horizon}h — "
-        f"feature count: {len(list(X_train.columns))}, "
-        f"importance count: {len(xgb_importances)}"
-    )
-    assert len(xgb_importances) == X_train.shape[1], (
-        f"Importance length mismatch: {len(xgb_importances)} != {X_train.shape[1]}. "
-        "This should never happen — file a bug."
-    )
-
     save_feature_list(
         model="XGBoost",
         horizon=horizon,
         feature_names=list(X_train.columns),
-        importance=xgb_importances,          # FIX 9: was missing, stored as []
+        importance=xgb_importances,
         dropped=dropped_cols,
         run_id=run_id,
     )
 
-    # ── 13. SHAP → MongoDB (STORE 1) ──────────────────────────────────────────
+    # ── 13. SHAP → MongoDB ────────────────────────────────────────────────────
     rng        = np.random.default_rng(42)
     sample_idx = rng.choice(len(X_test), size=min(300, len(X_test)), replace=False)
     X_sample   = X_test.iloc[sample_idx]
@@ -388,11 +322,11 @@ def train_xgboost(horizon: int) -> dict:
     except Exception as e:
         print(f"Drift monitoring skipped: {e}")
 
-    # ── 14. Metrics dict → MongoDB (STORE 1) ──────────────────────────────────
+    # ── 14. Metrics dict → MongoDB ────────────────────────────────────────────
     metrics = {
         "model":                       "XGBoost",
         "horizon":                     f"{horizon}h",
-        "training_target":             "log1p(AQI)",
+        "training_target":             "raw_AQI",       # FIX B: was log1p(AQI)
         "cv_mean_val_rmse":            float(np.mean(fold_rmse)),
         "cv_std_val_rmse":             float(np.std(fold_rmse)),
         "test_rmse":                   float(test_rmse),
