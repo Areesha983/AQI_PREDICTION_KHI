@@ -151,9 +151,9 @@ def train_xgboost(horizon: int) -> dict:
         X_fv, y_fv = X_train.iloc[val_idx], y_train_raw.iloc[val_idx]
 
         fw = np.ones(len(y_ft))
-        fw[y_ft.values > 100] = 2.0
-        fw[y_ft.values > 150] = 3.0
-        fw[y_ft.values > 200] = 6.0
+        fw[y_ft.values > 100] = 1.5
+        fw[y_ft.values > 150] = 2.0
+        fw[y_ft.values > 200] = 3.0
 
         fm = xgb.XGBRegressor(
             n_estimators=600,
@@ -177,30 +177,30 @@ def train_xgboost(horizon: int) -> dict:
         y_train_raw,
         y_train_raw=y_train_raw,
         spike_threshold=150,
-        target_spike_fraction=0.07,
+        target_spike_fraction=0.04,  # reduced from 0.07 — prevents low-AQI baseline collapse
     )
 
     # ── 5. Sample weights on augmented training set ───────────────────────────
     sw = np.ones(len(y_train_aug))
-    sw[y_train_aug.values > 100] = 2.0
-    sw[y_train_aug.values > 150] = 3.0
-    sw[y_train_aug.values > 200] = 6.0
+    sw[y_train_aug.values > 100] = 1.5
+    sw[y_train_aug.values > 150] = 2.0
+    sw[y_train_aug.values > 200] = 3.0
 
     # ── 6. Final XGBoost model (FIX C + FIX D) ────────────────────────────────
     # Early stopping uses X_cal / y_cal — the real held-out calibration set.
     # This prevents the model from overfitting to training data and gives a
     # stable stopping point aligned with actual generalisation performance.
     model = xgb.XGBRegressor(
-        n_estimators=1000,              # FIX C: was 600
-        max_depth=7,
-        learning_rate=0.05,             # FIX C: was 0.02
+        n_estimators=1000,
+        max_depth=6,                    # reduced from 7 — less overfitting to spike patterns
+        learning_rate=0.05,
         subsample=0.8,
         colsample_bytree=0.85,
-        min_child_weight=5,
-        reg_lambda=1.2,
+        min_child_weight=3,             # reduced from 5 — allows model to learn Good-range splits
+        reg_lambda=0.8,                 # reduced from 1.2 — less L2 shrinkage toward 0
         reg_alpha=0.05,
         tree_method="hist",
-        early_stopping_rounds=50,       # FIX C: was 80; converges faster at lr=0.05
+        early_stopping_rounds=50,
         random_state=42, n_jobs=-1, verbosity=0,
     )
     print("Training final XGBoost model (early stopping on calibration set)…")
