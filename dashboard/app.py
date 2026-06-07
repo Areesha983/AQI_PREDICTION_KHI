@@ -413,55 +413,69 @@ with st.sidebar:
     _dt_already_pkt: bool = False
 
     realtime_data, realtime_ok, realtime_err = _load_realtime_features(api_gateway)
+    processed_data, processed_ok, processed_err = _load_processed_features(api_gateway)
 
-    # Validate the realtime document's datetime is not a future forecast row
-    # that slipped through before the update_realtime.py filter fix was deployed.
-    # If it is, fall back to processed_features so the sidebar shows real data.
-    if realtime_ok and realtime_data:
-        _rt_raw = realtime_data.get("datetime") or realtime_data.get("timestamp")
-        if _rt_raw:
-            _rt_dt = None
-            for _fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S",
-                         "%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%d %H:%M:%S.%f"):
-                try:
-                    _rt_dt = datetime.strptime(str(_rt_raw)[:26], _fmt)
-                    break
-                except ValueError:
-                    pass
-            if _rt_dt is not None:
-                _now_pkt = datetime.utcnow() + _KARACHI_OFFSET
-                # Reject any realtime row whose PKT timestamp is more than 5 min
-                # in the future — it is a forecast row, not an observation.
-                if _rt_dt > _now_pkt + timedelta(minutes=5):
-                    realtime_ok  = False
-                    realtime_err = (
-                        f"Realtime timestamp {_rt_raw} is in the future "
-                        f"(now PKT: {_now_pkt.strftime('%H:%M')}) — "
-                        "falling back to processed_features."
-                    )
+    def _parse_dt_pkt(doc: dict, already_pkt: bool) -> datetime | None:
+        """Parse a document's datetime field into a naive PKT datetime for comparison."""
+        raw = doc.get("datetime") or doc.get("timestamp")
+        if not raw:
+            return None
+        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S",
+                    "%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%d %H:%M:%S.%f"):
+            try:
+                dt = datetime.strptime(str(raw)[:26], fmt)
+                return dt if already_pkt else dt + _KARACHI_OFFSET
+            except ValueError:
+                pass
+        return None
 
-    if realtime_ok:
+    _now_pkt = datetime.utcnow() + _KARACHI_OFFSET
+
+    # Parse timestamps from both sources (both normalised to PKT for comparison)
+    _rt_dt_pkt  = _parse_dt_pkt(realtime_data,  already_pkt=True)  if realtime_ok  else None
+    _proc_dt_pkt = _parse_dt_pkt(processed_data, already_pkt=False) if processed_ok else None
+
+    # Discard any realtime row that is in the future (forecast row, not observation)
+    if _rt_dt_pkt and _rt_dt_pkt > _now_pkt + timedelta(minutes=5):
+        _rt_dt_pkt  = None
+        realtime_ok = False
+        realtime_err = (
+            f"Realtime timestamp is in the future "
+            f"(now PKT: {_now_pkt.strftime('%H:%M')}) — comparing with processed_features."
+        )
+
+    # Choose the FRESHEST valid source.
+    # A 2-hour-old realtime row beats a 3-day-old processed row.
+    _use_realtime = (
+        realtime_ok and _rt_dt_pkt is not None and (
+            _proc_dt_pkt is None or _rt_dt_pkt >= _proc_dt_pkt
+        )
+    )
+
+    if _use_realtime:
         mongo_features.update(realtime_data)
         data_source_label = "🟢 Live  <span style='color:#334155;font-size:0.65rem;'>(realtime_observations)</span>"
         mongo_active    = True
         mongo_error     = None
-        # Open-Meteo returns timestamps in Asia/Karachi when called with
-        # &timezone=Asia%2FKarachi — the datetime stored is already PKT.
+        _dt_already_pkt = True
+    elif processed_ok:
+        mongo_features.update(processed_data)
+        data_source_label = "🟡 Cached  <span style='color:#334155;font-size:0.65rem;'>(processed_features · T-1)</span>"
+        mongo_active    = True
+        mongo_error     = realtime_err
+        _dt_already_pkt = False
+    elif realtime_ok:
+        # processed_features is unavailable but realtime exists (even if slightly stale)
+        mongo_features.update(realtime_data)
+        data_source_label = "🟡 Cached  <span style='color:#334155;font-size:0.65rem;'>(realtime_observations · stale)</span>"
+        mongo_active    = True
+        mongo_error     = processed_err
         _dt_already_pkt = True
     else:
-        processed_data, processed_ok, processed_err = _load_processed_features(api_gateway)
-        if processed_ok:
-            mongo_features.update(processed_data)
-            data_source_label = "🟡 Cached  <span style='color:#334155;font-size:0.65rem;'>(processed_features · T-1)</span>"
-            mongo_active    = True
-            mongo_error     = realtime_err
-            # processed_features stores UTC timestamps — conversion needed.
-            _dt_already_pkt = False
-        else:
-            data_source_label = "🔴 Offline  <span style='color:#334155;font-size:0.65rem;'>(defaults)</span>"
-            mongo_active    = False
-            mongo_error     = processed_err or realtime_err
-            _dt_already_pkt = False
+        data_source_label = "🔴 Offline  <span style='color:#334155;font-size:0.65rem;'>(defaults)</span>"
+        mongo_active    = False
+        mongo_error     = processed_err or realtime_err
+        _dt_already_pkt = False
 
     # ── Resolve current sensor values ─────────────────────────────────────────
     sim_pm25     = _d(mongo_features, "pm25",               "pm25_lag_1",        75.0)
