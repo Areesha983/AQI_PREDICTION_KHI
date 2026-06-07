@@ -414,6 +414,32 @@ with st.sidebar:
 
     realtime_data, realtime_ok, realtime_err = _load_realtime_features(api_gateway)
 
+    # Validate the realtime document's datetime is not a future forecast row
+    # that slipped through before the update_realtime.py filter fix was deployed.
+    # If it is, fall back to processed_features so the sidebar shows real data.
+    if realtime_ok and realtime_data:
+        _rt_raw = realtime_data.get("datetime") or realtime_data.get("timestamp")
+        if _rt_raw:
+            _rt_dt = None
+            for _fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S",
+                         "%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%d %H:%M:%S.%f"):
+                try:
+                    _rt_dt = datetime.strptime(str(_rt_raw)[:26], _fmt)
+                    break
+                except ValueError:
+                    pass
+            if _rt_dt is not None:
+                _now_pkt = datetime.utcnow() + _KARACHI_OFFSET
+                # Reject any realtime row whose PKT timestamp is more than 5 min
+                # in the future — it is a forecast row, not an observation.
+                if _rt_dt > _now_pkt + timedelta(minutes=5):
+                    realtime_ok  = False
+                    realtime_err = (
+                        f"Realtime timestamp {_rt_raw} is in the future "
+                        f"(now PKT: {_now_pkt.strftime('%H:%M')}) — "
+                        "falling back to processed_features."
+                    )
+
     if realtime_ok:
         mongo_features.update(realtime_data)
         data_source_label = "🟢 Live  <span style='color:#334155;font-size:0.65rem;'>(realtime_observations)</span>"
