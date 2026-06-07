@@ -131,10 +131,16 @@ def main() -> None:
     merged = aq_df if wx_df.empty else pd.merge(aq_df, wx_df, on="datetime", how="inner")
 
     # 4. Drop future hours — Open-Meteo forecast endpoint returns future rows too.
-    # We only want rows whose datetime has already passed in PKT (UTC+5) so the
-    # dashboard never shows a future timestamp as "current conditions".
-    now_pkt = datetime.utcnow() + timedelta(hours=5)
-    merged = merged[merged["datetime"] <= now_pkt].reset_index(drop=True)
+    # We only want rows whose hour has FULLY COMPLETED in PKT (UTC+5).
+    # Subtract 1 h from the truncated current hour so we never include the
+    # still-in-progress current hour or any forecast-future hour.
+    # e.g. pipeline runs at 23:00 PKT → last complete hour = 22:00 PKT.
+    now_utc = datetime.utcnow()
+    now_pkt = now_utc + timedelta(hours=5)
+    # Last fully completed hour
+    last_complete_hour_pkt = now_pkt.replace(minute=0, second=0, microsecond=0) - timedelta(hours=1)
+    merged = merged[merged["datetime"] <= last_complete_hour_pkt].reset_index(drop=True)
+    print(f"  Now (PKT): {now_pkt.strftime('%Y-%m-%d %H:%M')} | Cutoff: {last_complete_hour_pkt.strftime('%Y-%m-%d %H:%M')} | Rows after filter: {len(merged)}")
 
     if merged.empty:
         print("  No past-hour rows after future-filter. Skipping upsert.")

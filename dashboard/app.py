@@ -329,17 +329,11 @@ def _to_karachi_str(raw_dt, already_pkt: bool = False) -> str | None:
       The historical pipeline stores timestamps as UTC ISO strings.
       Pass already_pkt=False (default) — add +5 h to convert to PKT.
 
-    Why the bug happened before:
-      The old code always added +5 h regardless of source.  For realtime data
-      (already PKT) this added a phantom extra 5 hours — "2026-06-07 23:00 PKT"
-      became "2026-06-08 04:00 PKT", showing the wrong date AND the wrong hour,
-      which then pulled the wrong temperature value (29 °C at 04:00 vs ~38 °C
-      at the actual afternoon time).
-
-    Accepts:
-      - datetime objects (naive assumed UTC unless already_pkt=True)
-      - ISO/space-separated strings "2026-06-07T18:00:00" / "2026-06-07 18:00:00"
-      - Any other string → returned truncated as-is (graceful fallback)
+    Sanity check: if already_pkt=True and the parsed time is more than 2 h
+    in the future relative to current PKT wall clock, it means a future
+    forecast row slipped through the update_realtime.py filter (e.g. pipeline
+    ran at the top of the hour before the fix was deployed).  In that case the
+    timestamp is clamped and flagged so the user isn't misled.
     """
     if raw_dt is None:
         return None
@@ -360,7 +354,12 @@ def _to_karachi_str(raw_dt, already_pkt: bool = False) -> str | None:
             return str(raw_dt)[:16]
 
     if already_pkt:
-        # Timestamp is already in Karachi local time — display directly
+        # Sanity check: realtime timestamps should never be more than 2 h ahead
+        # of current PKT wall clock.  If they are, a future forecast row slipped
+        # through — flag it so the user knows the data may be stale.
+        now_pkt = datetime.utcnow() + _KARACHI_OFFSET
+        if dt > now_pkt + timedelta(hours=2):
+            return dt.strftime("%Y-%m-%d %H:%M PKT") + " ⚠️ (future)"
         return dt.strftime("%Y-%m-%d %H:%M PKT")
 
     # Timestamp is UTC — add +5 h to convert to PKT
