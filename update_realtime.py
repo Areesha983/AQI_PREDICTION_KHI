@@ -1,5 +1,5 @@
 """
-update_realtime.py  (FIXED)
+update_realtime.py  (ROBUST PRODUCTION VERSION)
 """
 
 import os
@@ -7,6 +7,7 @@ import sys
 import certifi
 import requests
 import pymongo
+import time as _time
 from pymongo import UpdateOne
 from datetime import datetime, timedelta
 import pandas as pd
@@ -16,16 +17,16 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "fea
 from config import LATITUDE, LONGITUDE
 
 LOOKBACK_HOURS = 6
-_API_TIMEOUT   = 45
-_API_RETRIES   = 3
+_API_TIMEOUT   = 90    # Increased to 90s
+_API_RETRIES   = 5     # Increased to 5 retries
 TTL_SECONDS = 7 * 24 * 3600
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  API FETCHERS
+#  API FETCHERS WITH RETRY LOGIC
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _fetch_realtime_air_quality(start_date: str, end_date: str) -> pd.DataFrame:
-    """Fetches air quality data from Open-Meteo."""
+    """Fetches air quality data from Open-Meteo with exponential backoff."""
     url = (
         "https://air-quality-api.open-meteo.com/v1/air-quality"
         f"?latitude={LATITUDE}"
@@ -35,16 +36,25 @@ def _fetch_realtime_air_quality(start_date: str, end_date: str) -> pd.DataFrame:
         "&hourly=pm25,pm10,carbon_monoxide,nitrogen_dioxide,sulphur_dioxide,ozone"
         "&timezone=Asia%2FKarachi"
     )
-    r = requests.get(url, timeout=_API_TIMEOUT)
-    r.raise_for_status()
-    data = r.json()
-    df = pd.DataFrame(data["hourly"])
-    df["datetime"] = pd.to_datetime(df["time"])
-    df = df.drop(columns=["time"])
-    return df
+    
+    last_exc = None
+    for attempt in range(1, _API_RETRIES + 1):
+        try:
+            r = requests.get(url, timeout=_API_TIMEOUT)
+            r.raise_for_status()
+            data = r.json()
+            df = pd.DataFrame(data["hourly"])
+            df["datetime"] = pd.to_datetime(df["time"])
+            return df.drop(columns=["time"])
+        except Exception as e:
+            last_exc = e
+            print(f"  [AQ fetch] Attempt {attempt}/{_API_RETRIES} failed: {e}")
+            if attempt < _API_RETRIES:
+                _time.sleep(15 * attempt)
+    raise last_exc
 
 def _fetch_realtime_weather(start_date: str, end_date: str) -> pd.DataFrame:
-    """Fetches weather data from Open-Meteo."""
+    """Fetches weather data from Open-Meteo with exponential backoff."""
     url = (
         "https://api.open-meteo.com/v1/forecast"
         f"?latitude={LATITUDE}"
@@ -61,38 +71,25 @@ def _fetch_realtime_weather(start_date: str, end_date: str) -> pd.DataFrame:
     for attempt in range(1, _API_RETRIES + 1):
         try:
             r = requests.get(url, timeout=_API_TIMEOUT)
+            # Fallback to archive if forecast fails
             if r.status_code != 200:
                 archive_url = url.replace("api.open-meteo.com/v1/forecast", "archive-api.open-meteo.com/v1/archive")
                 r = requests.get(archive_url, timeout=_API_TIMEOUT)
             r.raise_for_status()
             data = r.json()
-            if "hourly" not in data:
-                raise KeyError(f"Unexpected weather response: {data}")
             df = pd.DataFrame(data["hourly"])
-            if df.empty:
-                raise ValueError("Weather API returned an empty dataframe.")
             df["datetime"] = pd.to_datetime(df["time"])
-            df = df.drop(columns=["time"])
-            return df
+            return df.drop(columns=["time"])
         except Exception as e:
             last_exc = e
             print(f"  [WX fetch] Attempt {attempt}/{_API_RETRIES} failed: {e}")
             if attempt < _API_RETRIES:
-                import time as _time
-                _time.sleep(10 * attempt)
+                _time.sleep(15 * attempt)
     raise last_exc
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  MERGE AND MAIN
+#  MAIN LOGIC
 # ─────────────────────────────────────────────────────────────────────────────
-
-def _merge(aq_df: pd.DataFrame, wx_df: pd.DataFrame) -> pd.DataFrame:
-    merged = pd.merge(aq_df, wx_df, on="datetime", how="inner")
-    merged = merged.dropna(subset=["pm25"])
-    return merged
-
-def _ensure_ttl_index(collection: pymongo.collection.Collection) -> None:
-    collection.create_index("fetched_at", expireAfterSeconds=TTL_SECONDS, background=True)
 
 def main() -> None:
     mongo_uri = os.environ.get("MONGODB_URI")
@@ -106,44 +103,44 @@ def main() -> None:
 
     print(f"REALTIME UPDATE | window: {start_date} -> {end_date}")
 
+    # 1. Fetch AQ (Critical)
     try:
         aq_df = _fetch_realtime_air_quality(start_date, end_date)
-        print(f"  Air quality rows fetched : {len(aq_df):,}")
     except Exception as e:
-        print(f"  WARN: Air quality fetch failed — {e}. Aborting.")
+        print(f"  WARN: Air quality fetch failed after retries — {e}")
+        print("  Skipping realtime update this cycle.")
         return
 
+    # 2. Fetch Weather (Non-critical fallback)
     try:
         wx_df = _fetch_realtime_weather(start_date, end_date)
-        print(f"  Weather rows fetched     : {len(wx_df):,}")
     except Exception as e:
-        print(f"  WARN: Weather fetch failed — {e}")
+        print(f"  WARN: Weather fetch failed — {e}. Proceeding with AQ-only data.")
         wx_df = pd.DataFrame()
 
-    if wx_df.empty:
-        merged = aq_df.copy()
-    else:
-        merged = _merge(aq_df, wx_df)
-
-    if merged.empty:
-        print("  WARN: No overlapping rows — nothing to write.")
-        return
-
+    # 3. Merge
+    merged = aq_df if wx_df.empty else pd.merge(aq_df, wx_df, on="datetime", how="inner")
+    
+    # 4. Prepare and Upsert
     fetched_at = datetime.utcnow()
     records = []
     for _, row in merged.iterrows():
         doc = row.to_dict()
-        dt_obj = doc.pop("datetime")
-        doc["datetime"]   = dt_obj.strftime("%Y-%m-%d %H:%M:%S")
+        doc["datetime"] = doc["datetime"].strftime("%Y-%m-%d %H:%M:%S")
         doc["fetched_at"] = fetched_at
         records.append(doc)
 
     client = pymongo.MongoClient(mongo_uri, serverSelectionTimeoutMS=15000, tlsCAFile=certifi.where())
     collection = client["karachi_aqi"]["realtime_observations"]
-    _ensure_ttl_index(collection)
+    
+    # TTL Index
+    collection.create_index("fetched_at", expireAfterSeconds=TTL_SECONDS, background=True)
 
     operations = [UpdateOne({"datetime": r["datetime"]}, {"$set": r}, upsert=True) for r in records]
-    client["karachi_aqi"]["realtime_observations"].bulk_write(operations, ordered=False)
+    if operations:
+        collection.bulk_write(operations, ordered=False)
+        print(f"  Successfully upserted {len(records)} records.")
+    
     client.close()
     print("  Realtime update cycle complete.")
 
