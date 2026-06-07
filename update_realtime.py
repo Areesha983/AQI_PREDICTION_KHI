@@ -129,8 +129,18 @@ def main() -> None:
 
     # 3. Merge
     merged = aq_df if wx_df.empty else pd.merge(aq_df, wx_df, on="datetime", how="inner")
-    
-    # 4. Prepare and Upsert
+
+    # 4. Drop future hours — Open-Meteo forecast endpoint returns future rows too.
+    # We only want rows whose datetime has already passed in PKT (UTC+5) so the
+    # dashboard never shows a future timestamp as "current conditions".
+    now_pkt = datetime.utcnow() + timedelta(hours=5)
+    merged = merged[merged["datetime"] <= now_pkt].reset_index(drop=True)
+
+    if merged.empty:
+        print("  No past-hour rows after future-filter. Skipping upsert.")
+        return
+
+    # 5. Prepare and Upsert
     fetched_at = datetime.utcnow()
     records = []
     for _, row in merged.iterrows():
