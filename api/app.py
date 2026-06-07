@@ -6,47 +6,25 @@ api/app.py
 KEY FIXES IN THIS VERSION
 ──────────────────────────
 FIX 1 — METRICS PATH SIMPLIFIED
-  _get_latest_metrics_doc() now always returns None, forcing _metrics_from_mongo()
-  to use the robust per-doc fallback (Shape D) that directly queries model_metrics
-  by {model, horizon_h}. The "primary path" was schema-mismatched and unreliable.
-
 FIX 2 — MODEL-AWARE FEATURE VECTOR (_build_feature_vector)
-  The function now accepts the full artifact dict instead of a bare feature-name
-  list.  For Ridge it reads 'use_interactions' + 'interaction_cols' from the
-  artifact and reconstructs every polynomial cross-term before inference,
-  matching exactly what train_ridge.py produced at training time.
-
 FIX 3 — PREDICT ROUTE WIRED TO FIXED BUILDER
-  /predict/<model_type>/<horizon> passes the full artifact dict to
-  _build_feature_vector() so Ridge gets its 210-column vector and RF/XGBoost
-  keep their 151-column vector, with zero-filling scoped per model.
-
 FIX 4 — NAMING CONSISTENCY
-  _API_TO_EVAL_NAME and _API_TO_STORE_NAME are unified into a single
-  _API_TO_MONGO_NAME mapping (the names are identical; two tables were redundant
-  and a potential source of drift).
-
-FIX 5 — RANDOM FOREST GUNICORN DEADLOCK (NEW)
-  RandomForestRegressor serialised with n_jobs=-1 forks child processes during
-  predict(), which deadlocks gunicorn's sync workers (SIGKILL → 500).
-  model.n_jobs is patched to 1 immediately after loading from MongoDB so that
-  predict() is always single-threaded at serving time.
-
-FIX 6 — XGBOOST RESIDUAL CORRECTOR APPLIED AT INFERENCE (NEW)
-  train_xgboost.py fits a GradientBoostingRegressor corrector on calibration
-  residuals and saves it inside the artifact dict under the key "corrector".
-  The previous predict route ignored it entirely, causing systematically biased
-  (low) predictions and degraded R² on the dashboard.  The corrector is now
-  applied after expm1() when present in the artifact.
-
-FIX 7 — FULL TRACEBACK LOGGED ON PREDICT FAILURE (NEW)
-  The except block now prints traceback.format_exc() so the actual root cause
-  of any inference failure is visible in Render logs instead of a bare str(e).
-
-UNCHANGED
-  - MongoDB-only artifact loading (GridFS via mongo_store.load_model_artifact)
-  - CORS, debug=False, all existing routes (/health, /shap, /debug/*)
-  - 5-minute in-memory caches for features and metrics
+FIX 5 — RANDOM FOREST GUNICORN DEADLOCK
+FIX 6 — XGBOOST RESIDUAL CORRECTOR APPLIED AT INFERENCE
+FIX 7 — FULL TRACEBACK LOGGED ON PREDICT FAILURE
+FIX 8 — RIDGE FEATURE IMPORTANCE ROUTE (NEW)
+  Ridge does not compute SHAP values (no TreeExplainer). It stores coefficient
+  magnitudes in model_features via save_feature_list(). The /features/<model>/<horizon>
+  route reads that collection and returns records in the same format as /shap so
+  the dashboard chart works without any changes.
+FIX 9 — /features/ ROUTE NULL-GUARD + INDEX MAP CORRECTED (NEW)
+  Importance values from MongoDB could theoretically be None in a corrupt/partial
+  doc. The sort key and record builder now guard against None to prevent
+  TypeError crashes. The root endpoint's endpoint map is also corrected to
+  accurately reflect that /features/ works for all models, not only Ridge.
+FIX 10 — DEAD _get_latest_metrics_doc STUB REMOVED (NEW)
+  The function always returned None and was never called from any route.
+  Keeping it created false impression of a second metrics code path; removed.
 """
 
 import os
@@ -77,7 +55,6 @@ DB_NAME     = "karachi_aqi"
 FEAT_COL    = "processed_features"
 METRICS_COL = "model_metrics"
 
-# Ensure training_pipeline is importable (for mongo_store)
 _PIPELINE_DIR = BASE_DIR / "training_pipeline"
 if str(_PIPELINE_DIR) not in sys.path:
     sys.path.insert(0, str(_PIPELINE_DIR))
@@ -90,7 +67,6 @@ MODEL_CACHE    : dict = {}
 VALID_MODELS   = ["random_forest", "xgboost", "ridge"]
 VALID_HORIZONS = {24, 48, 72}
 
-# Single authoritative name map: API slug → MongoDB model name
 _API_TO_MONGO_NAME: dict[str, str] = {
     "random_forest": "RandomForest",
     "xgboost":       "XGBoost",
@@ -101,9 +77,6 @@ _API_TO_MONGO_NAME: dict[str, str] = {
 _FEATURE_CACHE: dict = {"doc": None, "ts": 0.0}
 _METRICS_CACHE: dict = {"doc": None, "ts": 0.0}
 _CACHE_TTL = 300
-
-# Sentinel: distinguishes 'tried MongoDB, got nothing' from 'never tried'
-_MONGO_MISS = "__MONGO_MISS__"
 
 # ── Metric key aliases ────────────────────────────────────────────────────────
 _METRIC_ALIASES: dict[str, list[str]] = {
@@ -146,7 +119,6 @@ def _safe_float(val, default: float = 0.0) -> float:
 
 # ── Feature helpers ───────────────────────────────────────────────────────────
 def _get_latest_feature_doc() -> dict | None:
-    """Fetches the most-recent processed_features document (5-min cached)."""
     now = time.time()
     if _FEATURE_CACHE["doc"] is not None and (now - _FEATURE_CACHE["ts"]) < _CACHE_TTL:
         return _FEATURE_CACHE["doc"]
@@ -171,22 +143,7 @@ def _get_latest_feature_doc() -> dict | None:
         return None
 
 
-def _reconstruct_interaction_terms(
-    base: dict,
-    interaction_cols: list[str],
-) -> dict:
-    """
-    Reconstruct every pairwise cross-term that train_ridge._add_interaction_terms()
-    produced (PolynomialFeatures degree=2, interaction_only=True, include_bias=False).
-
-    Column naming matches sklearn's get_feature_names_out(): "colA colB"
-    (space-separated), which is what the Ridge artifact's feature_names list
-    contains for cross-terms.
-
-    Only terms whose BOTH base columns are present in `base` are added; the
-    rest are filled with 0.0 — the same behaviour as PolynomialFeatures when
-    the input contains NaN → 0.
-    """
+def _reconstruct_interaction_terms(base: dict, interaction_cols: list[str]) -> dict:
     extra: dict = {}
     present = [c for c in interaction_cols if c in base]
     for a, b in combinations(present, 2):
@@ -196,37 +153,18 @@ def _reconstruct_interaction_terms(
 
 
 def _build_feature_vector(artifact: dict, slider_overrides: dict) -> pd.DataFrame:
-    """
-    Build a model-specific inference DataFrame.
-
-    Steps
-    ─────
-    1. Load the most-recent processed_features doc as a base row.
-    2. Overlay AQI-derived slider values on the relevant lag-1 columns.
-    3. If the artifact uses Ridge-style interaction terms, reconstruct them
-       from the base values so Ridge gets its full 210-column vector.
-    4. Align to artifact['feature_names'], zero-filling any missing columns.
-    5. Return a single-row DataFrame ready for model.predict().
-
-    Parameters
-    ──────────
-    artifact        : full dict returned by mongo_store.load_model_artifact()
-    slider_overrides: dict from the POST body's 'features' key
-    """
-    expected_features  : list[str] = artifact["feature_names"]
-    use_interactions   : bool      = artifact.get("use_interactions", False)
-    interaction_cols   : list[str] = artifact.get("interaction_cols", [])
+    expected_features : list[str] = artifact["feature_names"]
+    use_interactions  : bool      = artifact.get("use_interactions", False)
+    interaction_cols  : list[str] = artifact.get("interaction_cols", [])
 
     latest_doc = _get_latest_feature_doc()
 
-    # Step 1 — seed base from latest MongoDB doc (all numeric fields)
     base: dict = (
         {f: _safe_float(latest_doc.get(f), 0.0) for f in expected_features}
         if latest_doc
         else {f: 0.0 for f in expected_features}
     )
 
-    # Step 2 — compute AQI from PM2.5 and overlay slider values on lag-1 keys
     def _aqi_from_pm25(pm25: float) -> float:
         if np.isnan(pm25) or pm25 < 0:
             return float("nan")
@@ -251,7 +189,6 @@ def _build_feature_vector(artifact: dict, slider_overrides: dict) -> pd.DataFram
     if np.isnan(aqi_now):
         aqi_now = _safe_float(base.get("aqi_lag_1"), 75.0)
 
-    # Base overrides applied to every model
     lag1_overrides: dict = {
         "aqi_lag_1":         aqi_now,
         "pm25_lag_1":        pm25,
@@ -259,7 +196,6 @@ def _build_feature_vector(artifact: dict, slider_overrides: dict) -> pd.DataFram
         "temperature_lag_1": temp,
         "humidity_lag_1":    hum,
         "wind_speed_lag_1":  wind,
-        # Derived features used by RF/XGBoost (present in their feature_names)
         "interaction_pm25_humidity":     pm25 * hum / 100.0,
         "interaction_pm25_wind_inverse": pm25 / (wind + 0.5),
         "temp_humidity":                 temp * hum,
@@ -272,43 +208,19 @@ def _build_feature_vector(artifact: dict, slider_overrides: dict) -> pd.DataFram
         if k in base:
             base[k] = v
 
-    # Step 3 — reconstruct Ridge polynomial cross-terms when required
     if use_interactions and interaction_cols:
-        # Build a lookup with the CURRENT (post-override) values of all base
-        # columns so the cross-terms reflect the sliders, not stale DB values.
-        full_lookup = {**base, **lag1_overrides}   # lag1_overrides wins on overlap
+        full_lookup = {**base, **lag1_overrides}
         cross_terms = _reconstruct_interaction_terms(full_lookup, interaction_cols)
         base.update(cross_terms)
 
-    # Step 4 — align to model's exact feature list, zero-fill any gaps
     row = {f: _safe_float(base.get(f), 0.0) for f in expected_features}
-
-    df = pd.DataFrame([row])[expected_features]
-    df = df.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    df  = pd.DataFrame([row])[expected_features]
+    df  = df.replace([np.inf, -np.inf], np.nan).fillna(0.0)
     return df
 
 
-# ── Model artifact loader (MongoDB-only) ─────────────────────────────────────
+# ── Model artifact loader ─────────────────────────────────────────────────────
 def load_prediction_artifacts(model_type: str, horizon: int) -> dict:
-    """
-    Loads a trained model artifact from MongoDB (GridFS via mongo_store).
-
-    Returns the full artifact dict:
-        {
-          "model":            <fitted estimator>,
-          "feature_names":    [...],
-          "conformal_margin": float,
-          "use_log":          bool,
-          "use_interactions": bool,      # Ridge only
-          "interaction_cols": [...],     # Ridge only
-          "corrector":        <GBR>,     # XGBoost only
-        }
-
-    Results are cached in MODEL_CACHE for the lifetime of the process.
-
-    FIX 5: After loading a RandomForestRegressor, n_jobs is patched to 1
-    so that predict() never forks child processes inside gunicorn sync workers.
-    """
     cache_key = f"{model_type}_{horizon}"
     if cache_key in MODEL_CACHE:
         return MODEL_CACHE[cache_key]
@@ -326,10 +238,6 @@ def load_prediction_artifacts(model_type: str, horizon: int) -> dict:
             f"Run the training script for '{model_type}' first."
         )
 
-    # FIX 5: Patch n_jobs on the fitted estimator so gunicorn sync workers
-    # never attempt to fork child processes during predict().
-    # RandomForestRegressor with n_jobs=-1 uses Python multiprocessing at
-    # predict time, which deadlocks inside a forked gunicorn worker → 500.
     model_obj = artifact.get("model")
     if model_obj is not None and hasattr(model_obj, "n_jobs"):
         model_obj.n_jobs = 1
@@ -342,37 +250,12 @@ def load_prediction_artifacts(model_type: str, horizon: int) -> dict:
 
 
 # ── Metrics helpers ───────────────────────────────────────────────────────────
-def _get_latest_metrics_doc() -> dict | None:
-    """
-    FIX 1 — Always returns None.
-
-    The previous primary path attempted to fetch a single aggregate pipeline_runs
-    document and normalise it across multiple schema shapes (A/B/C). That path
-    was brittle: when evaluate.py had not run, or the document schema differed,
-    the whole metrics API returned zeros.
-
-    The robust fallback in _metrics_from_mongo() queries model_metrics directly
-    per (model, horizon_h) — exactly how save_metrics() writes them — and is
-    always correct.  Bypassing the primary path here forces that fallback to
-    run every time with zero schema-mismatch risk.
-    """
-    return None
-
-
 def _metrics_from_mongo(model_type: str) -> dict:
-    """
-    Queries model_metrics directly for each (store_name, horizon) pair
-    (Shape D — individual docs written by save_metrics() in each trainer).
-
-    Falls back to an empty error dict if MongoDB is unreachable or empty
-    for a given horizon.
-    """
     store_name = _API_TO_MONGO_NAME.get(model_type)
     if not store_name:
         return {str(h): {"error": f"Unknown model type: {model_type!r}"} for h in sorted(VALID_HORIZONS)}
 
     report: dict = {}
-
     for h in sorted(VALID_HORIZONS):
         h_key = f"{h}h"
         try:
@@ -395,11 +278,10 @@ def _metrics_from_mongo(model_type: str) -> dict:
                 }
                 print(f"[metrics] {store_name}/{h_key} loaded from model_metrics ✓")
             else:
-                reason = (
+                report[str(h)] = {"error": (
                     f"No metrics found in MongoDB for model='{store_name}', horizon={h_key}. "
                     "Run the training script first."
-                )
-                report[str(h)] = {"error": reason}
+                )}
                 print(f"[metrics] {store_name}/{h_key} — MongoDB miss.")
 
         except PyMongoError as e:
@@ -409,31 +291,45 @@ def _metrics_from_mongo(model_type: str) -> dict:
     return report
 
 
-# ── Routes ────────────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+#  ROUTES
+# ═════════════════════════════════════════════════════════════════════════════
+
 @app.route("/", methods=["GET"])
 def index():
-    """Root endpoint — confirms the API is online (required by Render health checks)."""
     return jsonify({
         "message": "AQI Prediction API is active.",
         "service": "Karachi AQI Forecasting API",
         "status":  "running",
         "endpoints": {
-            "health":            "/health",
-            "latest_features":   "/latest_features",
-            "predict_24h_rf":    "/predict/random_forest/24",
-            "predict_24h_xgb":   "/predict/xgboost/24",
-            "predict_24h_ridge": "/predict/ridge/24",
-            "metrics_rf":        "/metrics/random_forest",
-            "metrics_xgb":       "/metrics/xgboost",
-            "metrics_ridge":     "/metrics/ridge",
-            "all_metrics":       "/metrics/all",
-            "shap_rf_24h":       "/shap/random_forest/24",
-            "shap_xgb_24h":      "/shap/xgboost/24",
-            "shap_ridge_24h":    "/shap/ridge/24",
-            "debug_artifacts":   "/debug/artifacts",
-            "debug_features":    "/debug/features_raw",
-            "debug_metrics":     "/debug/metrics_raw",
-            "latest_realtime":   "/latest_realtime",
+            # ── health / data ──────────────────────────────────────────────
+            "health":              "/health",
+            "latest_features":     "/latest_features",
+            "latest_realtime":     "/latest_realtime",
+            # ── predict ───────────────────────────────────────────────────
+            "predict_24h_rf":      "/predict/random_forest/24",
+            "predict_24h_xgb":     "/predict/xgboost/24",
+            "predict_24h_ridge":   "/predict/ridge/24",
+            # ── metrics ───────────────────────────────────────────────────
+            "metrics_rf":          "/metrics/random_forest",
+            "metrics_xgb":         "/metrics/xgboost",
+            "metrics_ridge":       "/metrics/ridge",
+            "all_metrics":         "/metrics/all",
+            # ── SHAP (RF + XGBoost) ───────────────────────────────────────
+            "shap_rf_24h":         "/shap/random_forest/24",
+            "shap_xgb_24h":        "/shap/xgboost/24",
+            # ── feature importance (all models, all horizons) ─────────────
+            # FIX 9: corrected — this route works for rf/xgboost/ridge at
+            # 24/48/72h. Ridge uses |coef| magnitudes; RF/XGB use gain
+            # importances. Returns {"feature": str, "mean_abs_shap": float}
+            # records for drop-in dashboard compatibility.
+            "features_24h":        "/features/<model>/24",
+            "features_48h":        "/features/<model>/48",
+            "features_72h":        "/features/<model>/72",
+            # ── debug ─────────────────────────────────────────────────────
+            "debug_artifacts":     "/debug/artifacts",
+            "debug_features":      "/debug/features_raw",
+            "debug_metrics":       "/debug/metrics_raw",
         },
     }), 200
 
@@ -467,24 +363,11 @@ def latest_features():
 
 @app.route("/latest_realtime", methods=["GET"])
 def latest_realtime():
-    """
-    Returns the single most recent document from `realtime_observations`.
-    Written by update_realtime.py every hour with today's partial data.
-
-    Falls back to a 503 if the collection is empty (e.g. update_realtime.py
-    hasn't run yet), so the Streamlit dashboard can gracefully fall back to
-    /latest_features instead.
-
-    Exposed columns are raw sensor values (pm25, pm10, temperature_2m, etc.)
-    matching exactly what Open-Meteo returns, so the dashboard _d() helper
-    can read them by their raw names before the feature engineering lag step.
-    """
     try:
         client = _mongo_client()
         db     = client[DB_NAME]
         col    = db["realtime_observations"]
-        # Sort by datetime string — ISO-sortable so lexicographic == chronological
-        doc = col.find_one({}, sort=[("datetime", -1)])
+        doc    = col.find_one({}, sort=[("datetime", -1)])
         client.close()
 
         if doc is None:
@@ -493,10 +376,7 @@ def latest_realtime():
             }), 503
 
         doc.pop("_id", None)
-        # Expose raw sensor fields + datetime; drop the TTL anchor (fetched_at)
-        # to avoid sending a non-JSON-serialisable datetime object.
         doc.pop("fetched_at", None)
-
         return jsonify(doc), 200
 
     except PyMongoError as e:
@@ -516,23 +396,17 @@ def predict_aqi(model_type: str, horizon: int):
         return jsonify({"error": "Body must contain a 'features' key."}), 400
 
     try:
-        # Load artifact — n_jobs already patched to 1 inside load_prediction_artifacts
         artifact         = load_prediction_artifacts(model_type, horizon)
         model            = artifact["model"]
         conformal_margin = artifact["conformal_margin"]
         use_log          = artifact.get("use_log", False)
 
-        # Build the model-specific feature vector (handles Ridge interactions, etc.)
         input_df       = _build_feature_vector(artifact, payload["features"])
         raw_prediction = float(model.predict(input_df)[0])
 
         if use_log:
             raw_prediction = float(np.expm1(max(0.0, raw_prediction)))
 
-        # FIX 6: Apply XGBoost residual corrector when present in artifact.
-        # train_xgboost.py fits a GradientBoostingRegressor on calibration
-        # residuals and stores it under artifact["corrector"].  Without this
-        # the predictions are systematically biased low → poor dashboard R².
         corrector = artifact.get("corrector")
         if corrector is not None:
             try:
@@ -540,11 +414,9 @@ def predict_aqi(model_type: str, horizon: int):
                 raw_prediction = float(np.clip(raw_prediction + correction, 0.0, 500.0))
                 print(f"[predict] {model_type}/{horizon}h corrector applied: Δ={correction:+.2f}")
             except Exception as corr_err:
-                # Non-fatal: log and continue without correction
                 print(f"[predict] {model_type}/{horizon}h corrector failed (skipped): {corr_err}")
 
         raw_prediction = float(np.clip(raw_prediction, 0.0, 500.0))
-
         lower = float(np.clip(raw_prediction - conformal_margin, 0.0, 500.0))
         upper = float(np.clip(raw_prediction + conformal_margin, 0.0, 500.0))
 
@@ -572,7 +444,6 @@ def predict_aqi(model_type: str, horizon: int):
             "hint":  f"Train '{model_type}' and ensure mongo_store.save_model_artifact() ran.",
         }), 500
     except Exception as e:
-        # FIX 7: Print full traceback so the real root cause is visible in Render logs
         print(f"[predict] EXCEPTION for {model_type}/{horizon}h:\n{traceback.format_exc()}")
         return jsonify({"error": f"Inference failure: {str(e)}"}), 500
 
@@ -592,7 +463,10 @@ def get_all_metrics():
 
 @app.route("/shap/<string:model_type>/<int:horizon>", methods=["GET"])
 def get_shap(model_type: str, horizon: int):
-    """Returns top-10 SHAP records from model_shap collection for a given model+horizon."""
+    """Returns top-10 SHAP records from model_shap collection (RF + XGBoost).
+    Ridge has no TreeExplainer so model_shap is never populated for it;
+    the dashboard should fall back to /features/ridge/<horizon> in that case.
+    """
     model_type = model_type.lower()
     store_name = _API_TO_MONGO_NAME.get(model_type)
     if not store_name:
@@ -612,15 +486,99 @@ def get_shap(model_type: str, horizon: int):
                 "records": [],
                 "message": f"No SHAP data found for {store_name} {horizon}h. Run training pipeline first.",
             }), 200
-        records = doc.get("records", [])[:10]   # already sorted desc by save_shap()
+        records = doc.get("records", [])[:10]
         return jsonify({"model": store_name, "horizon_h": horizon, "records": records}), 200
     except Exception as e:
         return jsonify({"error": f"SHAP fetch failed: {str(e)}"}), 500
 
 
+@app.route("/features/<string:model_type>/<int:horizon>", methods=["GET"])
+def get_feature_importance(model_type: str, horizon: int):
+    """
+    Feature importance endpoint — works for ALL three models.
+
+    - Ridge: returns |coefficient| magnitudes stored by train_ridge.py via
+      save_feature_list(importance=[...]) — never has SHAP.
+    - XGBoost: returns gain-based importances stored by train_xgboost.py via
+      save_feature_list(importance=model.feature_importances_.tolist()).
+      (FIX 9: previously importance was omitted, resulting in [] being stored.)
+    - RandomForest: returns gain-based importances stored similarly.
+
+    All three return records in the same format as /shap for drop-in dashboard
+    compatibility:
+        {"feature": str, "mean_abs_shap": float}
+
+    The field is named mean_abs_shap for schema consistency; its value is
+    |coef| for Ridge and feature_importances_ gain for RF/XGBoost.
+
+    FIX 9 — None guard: importance values are guarded against None before
+    abs() and float() conversion to prevent TypeError on corrupt/partial docs.
+    """
+    model_type = model_type.lower()
+    store_name = _API_TO_MONGO_NAME.get(model_type)
+    if not store_name:
+        return jsonify({"error": f"Unknown model type: {model_type!r}. Choose from: {VALID_MODELS}"}), 400
+    if horizon not in VALID_HORIZONS:
+        return jsonify({"error": f"Invalid horizon. Choose from: {sorted(VALID_HORIZONS)}"}), 400
+    try:
+        client = _mongo_client()
+        db     = client[DB_NAME]
+        doc    = db["model_features"].find_one(
+            {"model": store_name, "horizon_h": horizon},
+            {"_id": 0, "feature_names": 1, "importance": 1},
+        )
+        client.close()
+
+        if not doc:
+            return jsonify({
+                "records": [],
+                "message": (
+                    f"No feature data found for {store_name} {horizon}h. "
+                    "Run the training pipeline first."
+                ),
+            }), 200
+
+        feature_names = doc.get("feature_names", [])
+        importance    = doc.get("importance", [])
+
+        if not feature_names or not importance:
+            return jsonify({
+                "records": [],
+                "message": (
+                    f"Feature list or importance array is empty for {store_name} {horizon}h. "
+                    "Retrain the model to populate importance values."
+                ),
+            }), 200
+
+        # FIX 9: Guard against None values in importance (corrupt/partial doc).
+        # Without this guard, abs(None) raises TypeError and the route crashes.
+        pairs = sorted(
+            zip(feature_names, importance),
+            key=lambda x: abs(x[1]) if x[1] is not None else 0.0,
+            reverse=True,
+        )[:10]
+
+        records = [
+            {
+                "feature":       f,
+                "mean_abs_shap": float(abs(v)) if v is not None else 0.0,
+            }
+            for f, v in pairs
+        ]
+
+        return jsonify({
+            "model":      store_name,
+            "horizon_h":  horizon,
+            "value_type": "coefficient_magnitude" if model_type == "ridge" else "gain_importance",
+            "records":    records,
+        }), 200
+
+    except Exception as e:
+        return jsonify({"error": f"Feature fetch failed: {str(e)}"}), 500
+
+
 @app.route("/debug/metrics_raw", methods=["GET"])
 def debug_metrics_raw():
-    """Returns raw documents from model_metrics for schema inspection."""
     try:
         client = _mongo_client()
         db     = client[DB_NAME]
@@ -633,7 +591,6 @@ def debug_metrics_raw():
 
 @app.route("/debug/features_raw", methods=["GET"])
 def debug_features_raw():
-    """Returns the latest processed_features document for field-name inspection."""
     try:
         client = _mongo_client()
         db     = client[DB_NAME]
@@ -654,7 +611,6 @@ def debug_features_raw():
 
 @app.route("/debug/artifacts", methods=["GET"])
 def debug_artifacts():
-    """Lists all model artifacts stored in MongoDB (model_name, horizon, feature_count, updated_at)."""
     try:
         client = _mongo_client()
         db     = client[DB_NAME]

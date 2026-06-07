@@ -26,6 +26,13 @@ Previously retained fixes:
 FIX 8 (NEW) — n_estimators 800→600, early_stopping_rounds 60→80
   Fewer max trees with more patience at lr=0.02 reduces overfitting and
   lets early stopping find the true optimum before the tree count runs out.
+
+FIX 9 (NEW) — Feature importances now extracted and passed to save_feature_list
+  Previously save_feature_list was called without an importance= argument,
+  causing model_features.importance to be stored as [] for all XGBoost
+  horizons. model.feature_importances_ (gain-based, aligned to X_train.columns)
+  is now extracted immediately after training and passed explicitly. This fixes
+  the /features/xgboost/<horizon> API route returning empty records.
 """
 
 import warnings
@@ -119,8 +126,8 @@ def _fit_residual_corrector(
     """
     R2 v3-2: Fit a shallow GBR on calibration residuals.
     This corrects systematic bias left by the main XGB model.
-    The corrector is stored in the artifact and applied at inference time
-    in app.py so that serving predictions match training-time accuracy.
+    The corrector is stored in the artifact and MUST be applied at inference
+    time in app.py (predict route) to match training-time accuracy.
     """
     residuals = y_cal_raw - cal_pred_raw
     corrector = GradientBoostingRegressor(
@@ -320,10 +327,28 @@ def train_xgboost(horizon: int) -> dict:
     save_residuals("XGBoost", horizon, y_arr, preds_raw, run_id)
 
     # ── 12. Feature importance → MongoDB (STORE 1) ────────────────────────────
+    # FIX 9: Extract gain-based importances from the fitted model BEFORE calling
+    # save_feature_list. Previously no importance= argument was passed, causing
+    # model_features.importance to be stored as [] for every XGBoost horizon,
+    # which broke the /features/xgboost/<horizon> API route.
+    # model.feature_importances_ is a numpy array aligned to X_train.columns;
+    # it is only available after model.fit() so this is the correct place.
+    xgb_importances = model.feature_importances_.tolist()
+    print(
+        f"  [train_xgboost] {horizon}h — "
+        f"feature count: {len(list(X_train.columns))}, "
+        f"importance count: {len(xgb_importances)}"
+    )
+    assert len(xgb_importances) == X_train.shape[1], (
+        f"Importance length mismatch: {len(xgb_importances)} != {X_train.shape[1]}. "
+        "This should never happen — file a bug."
+    )
+
     save_feature_list(
         model="XGBoost",
         horizon=horizon,
         feature_names=list(X_train.columns),
+        importance=xgb_importances,          # FIX 9: was missing, stored as []
         dropped=dropped_cols,
         run_id=run_id,
     )

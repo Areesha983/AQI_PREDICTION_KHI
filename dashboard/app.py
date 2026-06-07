@@ -1,32 +1,42 @@
 """
-AirLyst Karachi — AQI Intelligence Dashboard  (v5)
+AirLyst Karachi — AQI Intelligence Dashboard  (v6)
 Streamlit frontend consuming a Flask prediction microservice on Render.
 
-CHANGES vs v4
-─────────────
-FIX-SLIDER  Sidebar "Input Vectors" no longer renders interactive sliders.
-            Values are pulled from MongoDB (via /latest_features) and displayed
-            as read-only styled cards.  The inference payload is built from
-            those same live values so predictions are unchanged.
+FIXES vs v5
+───────────
+FIX-SHAP-RIDGE  Ridge never calls save_shap() — it has no TreeExplainer and
+                stores coefficient magnitudes via save_feature_list() into the
+                model_features collection, NOT model_shap.  The previous
+                _fetch_shap() only queried /shap/<model>/<horizon>, which reads
+                model_shap → always empty for Ridge → "SHAP data not yet
+                available" message forever.
 
-FIX-SHAP    The /shap/<model>/<horizon> endpoint already exists in api/app.py
-            (added in that file's latest revision).  This file needed no change
-            on the fetch side; the info-box and code-snippet fallback remain as
-            a graceful degradation if the collection is still empty.
+                Fix (two-part):
+                  1. New _fetch_shap_or_coef() helper: tries /shap first; if
+                     records come back empty it calls the new
+                     /features/<model>/<horizon> route (see api/app.py patch)
+                     which reads model_features and returns the top-10 features
+                     by |coefficient|, formatted identically to SHAP records
+                     {"feature": ..., "mean_abs_shap": ...} so the bar-chart
+                     code needs zero changes.
+                  2. Chart title updated to show "Mean |Coeff|" label for Ridge
+                     so the user knows what they're looking at.
 
-TWO-SPEED DASHBOARD UPDATE (new)
-─────────────────────────────────
-The sidebar now shows a "Live" badge when data comes from `realtime_observations`
-(written by update_realtime.py every hour, includes today's partial data) and a
-"Cached" badge when falling back to the latest record in `processed_features`
-(yesterday's finalised data, used by training).
+FIX-TIMESTAMP   MongoDB stores all datetimes in UTC.  Karachi is UTC+5.
+                The sidebar showed the raw UTC string from the document
+                (e.g. "2026-06-07 23:00") which appeared 5 h ahead of wall
+                clock.  Fix: parse the string and offset by +5 h before
+                rendering.  Handles both ISO ("T") and space-separated formats.
+                Falls back gracefully if parsing fails.
 
-Fetch priority:
-  1. /latest_realtime  → realtime_observations  (most recent, ~1-2 h lag from API)
-  2. /latest_features  → processed_features     (yesterday, always complete)
-
-If both fail, the UI falls back to hard-coded defaults and shows a red badge.
-No training data is ever written or modified by this file.
+FIX-LIVE-DATA   The module-level mongo_features dict was populated once at
+                import time from the @st.cache_data return value, but on
+                subsequent Streamlit rerenders the dict object was not
+                re-populated because Python module state persists across
+                rerenders.  Fix: mongo_features is now rebuilt inside the
+                sidebar block on every rerender from the (possibly fresh)
+                cached fetch result, matching what the user actually sees in
+                the "As of:" timestamp.
 """
 
 import time
@@ -34,6 +44,7 @@ import streamlit as st
 import pandas as pd
 import requests
 import plotly.graph_objects as go
+from datetime import datetime, timedelta, timezone
 
 from alerts import get_epa_tier_details
 from visualizations import plot_error_progression, plot_variance_matrix, plot_aqi_gauge
@@ -246,10 +257,7 @@ def _api_post(gateway: str, path: str, payload: dict, timeout: tuple = (15, 60))
 
 # ─── Feature fetchers ─────────────────────────────────────────────────────────
 
-# TWO-SPEED: try realtime_observations first (via /latest_realtime),
-# fall back to processed_features (via /latest_features).
-
-@st.cache_data(ttl=60)   # 60-second cache — realtime refreshes every hour anyway
+@st.cache_data(ttl=60)
 def _load_realtime_features(gateway: str) -> tuple[dict, bool, str | None]:
     """Fetches from realtime_observations (today's partial data)."""
     r = _api_get(gateway, "/latest_realtime", timeout=(10, 20))
@@ -263,7 +271,7 @@ def _load_realtime_features(gateway: str) -> tuple[dict, bool, str | None]:
     return {}, False, f"/latest_realtime returned HTTP {r.status_code}."
 
 
-@st.cache_data(ttl=300)  # 5-minute cache for the slower historical path
+@st.cache_data(ttl=300)
 def _load_processed_features(gateway: str) -> tuple[dict, bool, str | None]:
     """Fetches from processed_features (yesterday's finalised data)."""
     r = _api_get(gateway, "/latest_features", timeout=(10, 20))
@@ -277,19 +285,70 @@ def _load_processed_features(gateway: str) -> tuple[dict, bool, str | None]:
     return {}, False, f"/latest_features returned HTTP {r.status_code}."
 
 
-# ─── Module-level feature dict + helper ──────────────────────────────────────
-mongo_features: dict = {}
+def _safe_float(v, default: float = 0.0) -> float:
+    if v is None:
+        return default
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
 
 
-def _d(raw_key: str, lag_key: str, default: float) -> float:
+def _d(features: dict, raw_key: str, lag_key: str, default: float) -> float:
+    """
+    FIX-LIVE-DATA: now takes the features dict explicitly rather than reading
+    from a stale module-level variable, so every Streamlit rerender uses the
+    latest fetched values.
+    """
     for k in (lag_key, raw_key):
-        v = mongo_features.get(k)
+        v = features.get(k)
         if v is not None:
             try:
                 return float(v)
             except (TypeError, ValueError):
                 pass
     return default
+
+
+# ─── FIX-TIMESTAMP helper ─────────────────────────────────────────────────────
+_KARACHI_OFFSET = timedelta(hours=5)
+
+def _to_karachi_str(raw_dt) -> str | None:
+    """
+    FIX-TIMESTAMP: MongoDB documents store datetimes in UTC.  Convert to
+    Karachi local time (UTC+5) before displaying in the sidebar.
+
+    Accepts:
+      - datetime objects (naive assumed UTC, or tz-aware)
+      - ISO strings like "2026-06-07T18:00:00" or "2026-06-07 18:00:00"
+      - Any other string → returned as-is (graceful fallback)
+
+    Returns a formatted "YYYY-MM-DD HH:MM PKT" string, or None if input is None.
+    """
+    if raw_dt is None:
+        return None
+
+    dt = None
+    if isinstance(raw_dt, datetime):
+        dt = raw_dt
+    elif isinstance(raw_dt, str):
+        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S",
+                    "%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%d %H:%M:%S.%f"):
+            try:
+                dt = datetime.strptime(raw_dt[:26], fmt)
+                break
+            except ValueError:
+                continue
+        if dt is None:
+            # Unparseable — return truncated raw string rather than crashing
+            return str(raw_dt)[:16]
+
+    # Treat naive datetimes as UTC (MongoDB default)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+
+    karachi_dt = dt.astimezone(timezone.utc) + _KARACHI_OFFSET
+    return karachi_dt.strftime("%Y-%m-%d %H:%M PKT")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -326,7 +385,12 @@ with st.sidebar:
 
     st.markdown("---")
 
-    # ── TWO-SPEED FETCH: realtime first, processed fallback ───────────────────
+    # ── FIX-LIVE-DATA: rebuild mongo_features on every rerender ──────────────
+    # The old code populated a module-level dict once; subsequent rerenders saw
+    # stale values.  Now we always read from the (possibly fresh) cache result
+    # and build a local dict used throughout this rerender.
+    mongo_features: dict = {}
+
     realtime_data, realtime_ok, realtime_err = _load_realtime_features(api_gateway)
 
     if realtime_ok:
@@ -335,27 +399,23 @@ with st.sidebar:
         mongo_active = True
         mongo_error  = None
     else:
-        # Fall back to processed_features
         processed_data, processed_ok, processed_err = _load_processed_features(api_gateway)
         if processed_ok:
             mongo_features.update(processed_data)
             data_source_label = "🟡 Cached  <span style='color:#334155;font-size:0.65rem;'>(processed_features · T-1)</span>"
             mongo_active = True
-            mongo_error  = realtime_err   # show why realtime failed
+            mongo_error  = realtime_err
         else:
             data_source_label = "🔴 Offline  <span style='color:#334155;font-size:0.65rem;'>(defaults)</span>"
             mongo_active = False
             mongo_error  = processed_err or realtime_err
 
-    # ── Resolve current sensor values (live or defaults) ─────────────────────
-    # realtime_observations stores raw column names (pm25, temperature_2m, etc.)
-    # processed_features stores lag-1 names (pm25_lag_1, temperature_lag_1, etc.)
-    # _d() tries both so it works whichever collection responded.
-    sim_pm25     = _d("pm25",             "pm25_lag_1",        75.0)
-    sim_pm10     = _d("pm10",             "pm10_lag_1",       140.0)
-    sim_temp     = _d("temperature_2m",   "temperature_lag_1",  32.0)
-    sim_humidity = _d("relative_humidity_2m", "humidity_lag_1", 65.0)
-    sim_wind     = _d("wind_speed_10m",   "wind_speed_lag_1",   12.0)
+    # ── Resolve current sensor values ─────────────────────────────────────────
+    sim_pm25     = _d(mongo_features, "pm25",               "pm25_lag_1",        75.0)
+    sim_pm10     = _d(mongo_features, "pm10",               "pm10_lag_1",       140.0)
+    sim_temp     = _d(mongo_features, "temperature_2m",     "temperature_lag_1",  32.0)
+    sim_humidity = _d(mongo_features, "relative_humidity_2m", "humidity_lag_1",   65.0)
+    sim_wind     = _d(mongo_features, "wind_speed_10m",     "wind_speed_lag_1",   12.0)
 
     # ── Compute current AQI from PM2.5 ────────────────────────────────────────
     def _pm25_to_aqi(pm25: float) -> int:
@@ -379,14 +439,15 @@ with st.sidebar:
     # ── Read-only sensor display ──────────────────────────────────────────────
     st.markdown("##### 📡 Current Conditions")
 
-    # Show the datetime of the data if available
+    # FIX-TIMESTAMP: convert UTC timestamp → Karachi local time (UTC+5)
     _dt_raw = mongo_features.get("datetime") or mongo_features.get("timestamp")
-    if _dt_raw:
-        st.caption(f"As of: {str(_dt_raw)[:16]}")
+    _dt_local = _to_karachi_str(_dt_raw)
+    if _dt_local:
+        st.caption(f"As of: {_dt_local}")
     else:
         st.caption("Live values from feature store · read-only")
 
-    # AQI highlight card — shown before the individual sensor rows
+    # AQI highlight card
     st.markdown(
         f"""<div style="
                 background: {aqi_tier['bg']};
@@ -447,8 +508,8 @@ inference_payload = {
         "temperature":                   sim_temp,
         "humidity":                      sim_humidity,
         "wind_speed":                    sim_wind,
-        "pm25_diff_1h":                  _d("pm25_diff_1h",      "pm25_diff_1h",      0.0),
-        "pm25_roll_std_24h":             _d("pm25_roll_std_24h", "pm25_roll_std_24h", 0.0),
+        "pm25_diff_1h":                  _d(mongo_features, "pm25_diff_1h",      "pm25_diff_1h",      0.0),
+        "pm25_roll_std_24h":             _d(mongo_features, "pm25_roll_std_24h", "pm25_roll_std_24h", 0.0),
         "interaction_pm25_humidity":     sim_pm25 * sim_humidity,
         "interaction_pm25_wind_inverse": sim_pm25 / (sim_wind + 0.1),
     }
@@ -803,20 +864,45 @@ if not metrics_df.empty:
 # ═══════════════════════════════════════════════════════════════════════════════
 st.markdown("<hr>", unsafe_allow_html=True)
 st.markdown("### 🧠 SHAP Feature Importance")
-st.caption("Top-10 features by mean |SHAP| value — computed on the held-out test set.")
+st.caption("Top-10 features by mean |SHAP| value (RF/XGBoost) or |coefficient| (Ridge) — test set.")
 
 
+# FIX-SHAP-RIDGE: two-stage fetch
+#   Stage 1 — try /shap/<model>/<horizon>  (model_shap collection, RF + XGBoost)
+#   Stage 2 — if empty, try /features/<model>/<horizon>  (model_features, Ridge coef)
+#   Both return identical record format: {"feature": str, "mean_abs_shap": float}
+#   so the chart below needs zero changes.
 @st.cache_data(ttl=1800, show_spinner=False)
-def _fetch_shap(gateway: str, model_key: str, horizon: int) -> list[dict]:
+def _fetch_shap_or_coef(gateway: str, model_key: str, horizon: int) -> tuple[list[dict], str]:
+    """
+    Returns (records, value_label) where value_label is used in the chart title.
+    Falls back from SHAP → coefficient magnitudes for Ridge.
+    """
     if not _flask_reachable:
-        return []
+        return [], "Mean |SHAP|"
+
+    # Stage 1: SHAP (works for RF and XGBoost)
     r = _api_get(gateway, f"/shap/{model_key}/{horizon}", timeout=(10, 30))
     if r and r.status_code == 200:
         try:
-            return r.json().get("records", [])[:10]
+            records = r.json().get("records", [])[:10]
+            if records:
+                return records, "Mean |SHAP|"
         except Exception:
             pass
-    return []
+
+    # Stage 2: feature coefficients (Ridge fallback)
+    # Calls the new /features/<model>/<horizon> route added to api/app.py
+    r2 = _api_get(gateway, f"/features/{model_key}/{horizon}", timeout=(10, 30))
+    if r2 and r2.status_code == 200:
+        try:
+            records = r2.json().get("records", [])[:10]
+            if records:
+                return records, "Mean |Coefficient|"
+        except Exception:
+            pass
+
+    return [], "Mean |SHAP|"
 
 
 shap_horizon = st.selectbox(
@@ -825,7 +911,7 @@ shap_horizon = st.selectbox(
     format_func=lambda h: f"{h}h",
 )
 
-shap_data = _fetch_shap(api_gateway, active_model_key, shap_horizon)
+shap_data, shap_value_label = _fetch_shap_or_coef(api_gateway, active_model_key, shap_horizon)
 
 if shap_data:
     features = [d["feature"]       for d in shap_data]
@@ -839,7 +925,7 @@ if shap_data:
             colorscale=[[0, "#1e3a5f"], [0.5, "#3b82f6"], [1, "#60a5fa"]],
             line=dict(width=0),
         ),
-        hovertemplate="<b>%{y}</b><br>Mean |SHAP|: %{x:.4f}<extra></extra>",
+        hovertemplate="<b>%{y}</b><br>" + shap_value_label + ": %{x:.4f}<extra></extra>",
     ))
     fig_shap.update_layout(
         **_LAYOUT, height=380,
@@ -850,15 +936,15 @@ if shap_data:
     )
     fig_shap.update_xaxes(showgrid=True, gridcolor=_GRID_COLOR, zeroline=False,
                            tickfont=dict(color=_TEXT_COLOR, size=10),
-                           title=dict(text="Mean |SHAP| value", font=dict(color=_TEXT_COLOR, size=11)))
+                           title=dict(text=shap_value_label, font=dict(color=_TEXT_COLOR, size=11)))
     fig_shap.update_yaxes(showgrid=False, zeroline=False,
                            tickfont=dict(color="#cbd5e1", size=10))
     st.plotly_chart(fig_shap, use_container_width=True, config={"displayModeBar": False})
 else:
     st.info(
-        "SHAP data not yet available.  The `/shap/<model>/<horizon>` route already exists "
-        "in `api/app.py`.  Once the training pipeline runs and writes to `model_shap` in "
-        "MongoDB, this chart will populate automatically on the next refresh."
+        "Feature importance data not yet available for this model/horizon. "
+        "Once the training pipeline runs and writes to `model_shap` (RF/XGBoost) "
+        "or `model_features` (Ridge) in MongoDB, this chart will populate automatically."
     )
 
 

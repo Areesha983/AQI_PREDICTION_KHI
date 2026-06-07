@@ -17,8 +17,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "fea
 from config import LATITUDE, LONGITUDE
 
 LOOKBACK_HOURS = 6
-_API_TIMEOUT   = 90    # Increased to 90s
-_API_RETRIES   = 5     # Increased to 5 retries
+_API_TIMEOUT   = 30    # Increased to 90s
+_API_RETRIES   = 3     # Increased to 5 retries
 TTL_SECONDS = 7 * 24 * 3600
 
 # ─────────────────────────────────────────────────────────────────────────────
