@@ -13,18 +13,13 @@ FIX 5 — RANDOM FOREST GUNICORN DEADLOCK
 FIX 6 — XGBOOST RESIDUAL CORRECTOR APPLIED AT INFERENCE
 FIX 7 — FULL TRACEBACK LOGGED ON PREDICT FAILURE
 FIX 8 — RIDGE FEATURE IMPORTANCE ROUTE (NEW)
-  Ridge does not compute SHAP values (no TreeExplainer). It stores coefficient
-  magnitudes in model_features via save_feature_list(). The /features/<model>/<horizon>
-  route reads that collection and returns records in the same format as /shap so
-  the dashboard chart works without any changes.
 FIX 9 — /features/ ROUTE NULL-GUARD + INDEX MAP CORRECTED (NEW)
-  Importance values from MongoDB could theoretically be None in a corrupt/partial
-  doc. The sort key and record builder now guard against None to prevent
-  TypeError crashes. The root endpoint's endpoint map is also corrected to
-  accurately reflect that /features/ works for all models, not only Ridge.
 FIX 10 — DEAD _get_latest_metrics_doc STUB REMOVED (NEW)
-  The function always returned None and was never called from any route.
-  Keeping it created false impression of a second metrics code path; removed.
+FIX 11 — MODEL_CACHE TTL (1 hour) so stale artifacts auto-expire after retraining
+FIX 12 — _build_feature_vector always applies lag1_overrides via base.update()
+          instead of only updating keys already present in base. Prevents 0-valued
+          features when the feature doc is stale or missing a lag column.
+FIX 13 — /debug/feature_mismatch/<model>/<horizon> route added for diagnostics.
 """
 
 import os
@@ -63,9 +58,11 @@ app = Flask(__name__)
 CORS(app)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-MODEL_CACHE    : dict = {}
-VALID_MODELS   = ["random_forest", "xgboost", "ridge"]
-VALID_HORIZONS = {24, 48, 72}
+MODEL_CACHE     : dict = {}
+MODEL_CACHE_TS  : dict = {}          # FIX 11: timestamps for TTL enforcement
+MODEL_CACHE_TTL : int  = 3600        # FIX 11: 1-hour TTL — auto-expires after retraining
+VALID_MODELS    = ["random_forest", "xgboost", "ridge"]
+VALID_HORIZONS  = {24, 48, 72}
 
 _API_TO_MONGO_NAME: dict[str, str] = {
     "random_forest": "RandomForest",
@@ -126,9 +123,9 @@ def _get_latest_feature_doc() -> dict | None:
         client = _mongo_client()
         db     = client[DB_NAME]
         col    = db[FEAT_COL]
-        doc    = col.find_one({}, sort=[("timestamp", -1)])
+        doc    = col.find_one({}, sort=[("datetime", -1)])   # FIX: use datetime index (not timestamp)
         if doc is None:
-            doc = col.find_one({}, sort=[("datetime", -1)])
+            doc = col.find_one({}, sort=[("timestamp", -1)])
         client.close()
         if doc:
             doc.pop("_id", None)
@@ -204,16 +201,27 @@ def _build_feature_vector(artifact: dict, slider_overrides: dict) -> pd.DataFram
         "temp_to_wind_ratio":            temp / (wind + 0.1),
         "humidity_to_wind_ratio":        hum  / (wind + 0.1),
     }
-    for k, v in lag1_overrides.items():
-        if k in base:
-            base[k] = v
+
+    # FIX 12: use base.update() — always write lag overrides regardless of
+    # whether the key already exists in base. The old `if k in base` guard
+    # caused 0-valued features when the feature doc was stale or missing a
+    # lag column, which made XGBoost predict ~0 on near-zero inputs.
+    base.update(lag1_overrides)
 
     if use_interactions and interaction_cols:
-        full_lookup = {**base, **lag1_overrides}
-        cross_terms = _reconstruct_interaction_terms(full_lookup, interaction_cols)
+        cross_terms = _reconstruct_interaction_terms(base, interaction_cols)
         base.update(cross_terms)
 
     row = {f: _safe_float(base.get(f), 0.0) for f in expected_features}
+
+    # Warn when many features are defaulting to 0 (signals stale feature doc)
+    zero_count = sum(1 for v in row.values() if v == 0.0)
+    if zero_count > len(expected_features) * 0.25:
+        missing = [f for f in expected_features if base.get(f) is None or base.get(f) == 0.0]
+        print(f"[WARNING] _build_feature_vector: {zero_count}/{len(expected_features)} "
+              f"features are 0.0 — feature doc may be stale. "
+              f"Sample missing: {missing[:8]}")
+
     df  = pd.DataFrame([row])[expected_features]
     df  = df.replace([np.inf, -np.inf], np.nan).fillna(0.0)
     return df
@@ -222,7 +230,10 @@ def _build_feature_vector(artifact: dict, slider_overrides: dict) -> pd.DataFram
 # ── Model artifact loader ─────────────────────────────────────────────────────
 def load_prediction_artifacts(model_type: str, horizon: int) -> dict:
     cache_key = f"{model_type}_{horizon}"
-    if cache_key in MODEL_CACHE:
+    now = time.time()
+
+    # FIX 11: honour TTL — reload artifact after 1 hour so retraining takes effect
+    if cache_key in MODEL_CACHE and (now - MODEL_CACHE_TS.get(cache_key, 0)) < MODEL_CACHE_TTL:
         return MODEL_CACHE[cache_key]
 
     store_name = _API_TO_MONGO_NAME.get(model_type)
@@ -243,7 +254,8 @@ def load_prediction_artifacts(model_type: str, horizon: int) -> dict:
         model_obj.n_jobs = 1
         print(f"[model-cache] Patched n_jobs=1 on {store_name} {horizon}h (gunicorn safety)")
 
-    MODEL_CACHE[cache_key] = artifact
+    MODEL_CACHE[cache_key]    = artifact
+    MODEL_CACHE_TS[cache_key] = now
     n_features = len(artifact.get("feature_names", []))
     print(f"[model-cache] Loaded '{store_name}' {horizon}h from MongoDB ✓  ({n_features} features)")
     return artifact
@@ -302,34 +314,25 @@ def index():
         "service": "Karachi AQI Forecasting API",
         "status":  "running",
         "endpoints": {
-            # ── health / data ──────────────────────────────────────────────
             "health":              "/health",
             "latest_features":     "/latest_features",
             "latest_realtime":     "/latest_realtime",
-            # ── predict ───────────────────────────────────────────────────
             "predict_24h_rf":      "/predict/random_forest/24",
             "predict_24h_xgb":     "/predict/xgboost/24",
             "predict_24h_ridge":   "/predict/ridge/24",
-            # ── metrics ───────────────────────────────────────────────────
             "metrics_rf":          "/metrics/random_forest",
             "metrics_xgb":         "/metrics/xgboost",
             "metrics_ridge":       "/metrics/ridge",
             "all_metrics":         "/metrics/all",
-            # ── SHAP (RF + XGBoost) ───────────────────────────────────────
             "shap_rf_24h":         "/shap/random_forest/24",
             "shap_xgb_24h":        "/shap/xgboost/24",
-            # ── feature importance (all models, all horizons) ─────────────
-            # FIX 9: corrected — this route works for rf/xgboost/ridge at
-            # 24/48/72h. Ridge uses |coef| magnitudes; RF/XGB use gain
-            # importances. Returns {"feature": str, "mean_abs_shap": float}
-            # records for drop-in dashboard compatibility.
             "features_24h":        "/features/<model>/24",
             "features_48h":        "/features/<model>/48",
             "features_72h":        "/features/<model>/72",
-            # ── debug ─────────────────────────────────────────────────────
             "debug_artifacts":     "/debug/artifacts",
             "debug_features":      "/debug/features_raw",
             "debug_metrics":       "/debug/metrics_raw",
+            "debug_mismatch":      "/debug/feature_mismatch/<model>/<horizon>",
         },
     }), 200
 
@@ -463,10 +466,6 @@ def get_all_metrics():
 
 @app.route("/shap/<string:model_type>/<int:horizon>", methods=["GET"])
 def get_shap(model_type: str, horizon: int):
-    """Returns top-10 SHAP records from model_shap collection (RF + XGBoost).
-    Ridge has no TreeExplainer so model_shap is never populated for it;
-    the dashboard should fall back to /features/ridge/<horizon> in that case.
-    """
     model_type = model_type.lower()
     store_name = _API_TO_MONGO_NAME.get(model_type)
     if not store_name:
@@ -494,26 +493,6 @@ def get_shap(model_type: str, horizon: int):
 
 @app.route("/features/<string:model_type>/<int:horizon>", methods=["GET"])
 def get_feature_importance(model_type: str, horizon: int):
-    """
-    Feature importance endpoint — works for ALL three models.
-
-    - Ridge: returns |coefficient| magnitudes stored by train_ridge.py via
-      save_feature_list(importance=[...]) — never has SHAP.
-    - XGBoost: returns gain-based importances stored by train_xgboost.py via
-      save_feature_list(importance=model.feature_importances_.tolist()).
-      (FIX 9: previously importance was omitted, resulting in [] being stored.)
-    - RandomForest: returns gain-based importances stored similarly.
-
-    All three return records in the same format as /shap for drop-in dashboard
-    compatibility:
-        {"feature": str, "mean_abs_shap": float}
-
-    The field is named mean_abs_shap for schema consistency; its value is
-    |coef| for Ridge and feature_importances_ gain for RF/XGBoost.
-
-    FIX 9 — None guard: importance values are guarded against None before
-    abs() and float() conversion to prevent TypeError on corrupt/partial docs.
-    """
     model_type = model_type.lower()
     store_name = _API_TO_MONGO_NAME.get(model_type)
     if not store_name:
@@ -550,8 +529,6 @@ def get_feature_importance(model_type: str, horizon: int):
                 ),
             }), 200
 
-        # FIX 9: Guard against None values in importance (corrupt/partial doc).
-        # Without this guard, abs(None) raises TypeError and the route crashes.
         pairs = sorted(
             zip(feature_names, importance),
             key=lambda x: abs(x[1]) if x[1] is not None else 0.0,
@@ -594,9 +571,9 @@ def debug_features_raw():
     try:
         client = _mongo_client()
         db     = client[DB_NAME]
-        doc    = db[FEAT_COL].find_one({}, sort=[("timestamp", -1)])
+        doc    = db[FEAT_COL].find_one({}, sort=[("datetime", -1)])
         if doc is None:
-            doc = db[FEAT_COL].find_one({}, sort=[("datetime", -1)])
+            doc = db[FEAT_COL].find_one({}, sort=[("timestamp", -1)])
         client.close()
         if doc:
             doc.pop("_id", None)
@@ -624,6 +601,36 @@ def debug_artifacts():
                 d["feature_count"] = len(d.pop("feature_names"))
         return jsonify({"found": bool(docs), "count": len(docs), "artifacts": docs}), 200
     except PyMongoError as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/debug/feature_mismatch/<string:model_type>/<int:horizon>", methods=["GET"])
+def debug_feature_mismatch(model_type: str, horizon: int):
+    """FIX 13: Shows exactly which features the artifact expects but the feature doc is missing."""
+    model_type = model_type.lower()
+    if model_type not in VALID_MODELS:
+        return jsonify({"error": f"Invalid model. Choose from: {VALID_MODELS}"}), 400
+    if horizon not in VALID_HORIZONS:
+        return jsonify({"error": f"Invalid horizon. Choose from: {sorted(VALID_HORIZONS)}"}), 400
+    try:
+        artifact   = load_prediction_artifacts(model_type, horizon)
+        latest_doc = _get_latest_feature_doc()
+        expected   = set(artifact.get("feature_names", []))
+        present    = set(latest_doc.keys()) if latest_doc else set()
+        missing    = sorted(expected - present)
+        extra      = sorted(present - expected)
+        return jsonify({
+            "model":                      _API_TO_MONGO_NAME[model_type],
+            "horizon_h":                  horizon,
+            "artifact_feature_count":     len(expected),
+            "feature_doc_key_count":      len(present),
+            "missing_from_doc":           missing,
+            "missing_count":              len(missing),
+            "extra_in_doc_not_needed":    extra[:20],
+            "use_log":                    artifact.get("use_log"),
+            "use_corrector":              artifact.get("use_corrector"),
+        }), 200
+    except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
