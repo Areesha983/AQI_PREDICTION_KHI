@@ -1,5 +1,5 @@
 """
-update_realtime.py  (ROBUST PRODUCTION VERSION)
+update_realtime.py  (FULLY ROBUST PRODUCTION VERSION)
 """
 
 import os
@@ -27,13 +27,14 @@ TTL_SECONDS = 7 * 24 * 3600
 
 def _fetch_realtime_air_quality(start_date: str, end_date: str) -> pd.DataFrame:
     """Fetches air quality data from Open-Meteo with exponential backoff."""
+    # Note: Using correct Open-Meteo param names (pm2_5) and renaming to internal schema
     url = (
         "https://air-quality-api.open-meteo.com/v1/air-quality"
         f"?latitude={LATITUDE}"
         f"&longitude={LONGITUDE}"
         f"&start_date={start_date}"
         f"&end_date={end_date}"
-        "&hourly=pm25,pm10,carbon_monoxide,nitrogen_dioxide,sulphur_dioxide,ozone"
+        "&hourly=pm2_5,pm10,carbon_monoxide,nitrogen_dioxide,sulphur_dioxide,ozone,dust,uv_index"
         "&timezone=Asia%2FKarachi"
     )
     
@@ -45,7 +46,16 @@ def _fetch_realtime_air_quality(start_date: str, end_date: str) -> pd.DataFrame:
             data = r.json()
             df = pd.DataFrame(data["hourly"])
             df["datetime"] = pd.to_datetime(df["time"])
-            return df.drop(columns=["time"])
+            df = df.drop(columns=["time"])
+            
+            # Standardize names to match historical feature pipeline
+            df = df.rename(columns={
+                "pm2_5": "pm25",
+                "carbon_monoxide": "co",
+                "nitrogen_dioxide": "no2",
+                "sulphur_dioxide": "so2",
+            })
+            return df
         except Exception as e:
             last_exc = e
             print(f"  [AQ fetch] Attempt {attempt}/{_API_RETRIES} failed: {e}")
@@ -71,7 +81,6 @@ def _fetch_realtime_weather(start_date: str, end_date: str) -> pd.DataFrame:
     for attempt in range(1, _API_RETRIES + 1):
         try:
             r = requests.get(url, timeout=_API_TIMEOUT)
-            # Fallback to archive if forecast fails
             if r.status_code != 200:
                 archive_url = url.replace("api.open-meteo.com/v1/forecast", "archive-api.open-meteo.com/v1/archive")
                 r = requests.get(archive_url, timeout=_API_TIMEOUT)
@@ -103,12 +112,12 @@ def main() -> None:
 
     print(f"REALTIME UPDATE | window: {start_date} -> {end_date}")
 
-    # 1. Fetch AQ (Critical)
+    # 1. Fetch AQ (Critical - Graceful Exit)
     try:
         aq_df = _fetch_realtime_air_quality(start_date, end_date)
     except Exception as e:
         print(f"  WARN: Air quality fetch failed after retries — {e}")
-        print("  Skipping realtime update this cycle.")
+        print("  Skipping realtime update this cycle to prevent pipeline failure.")
         return
 
     # 2. Fetch Weather (Non-critical fallback)
