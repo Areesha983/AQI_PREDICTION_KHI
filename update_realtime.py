@@ -24,12 +24,16 @@ if the very latest slot is still NaN-filled.
 """
 
 import os
+import sys
 import certifi
 import requests
 import pymongo
 from pymongo import UpdateOne
 from datetime import datetime, timedelta
 import pandas as pd
+
+# config.py lives in feature_pipeline/ — add it to the path so we can import it
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "feature_pipeline"))
 from config import LATITUDE, LONGITUDE
 
 # ── How far back to look on each run ─────────────────────────────────────────
