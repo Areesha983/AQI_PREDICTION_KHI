@@ -609,8 +609,8 @@ if not _flask_reachable:
 
 # ─── Single-horizon prediction helper ────────────────────────────────────────
 def _fetch_prediction(model_key: str, horizon: int) -> dict | None:
-    if not _flask_reachable:
-        return None
+    # Note: no _flask_reachable gate here — predictions attempt regardless so a
+    # stale False health-check cache doesn't block gauges when the API is up.
     r = _api_post(api_gateway, f"/predict/{model_key}/{horizon}", inference_payload)
     if r is None:
         return None
@@ -729,7 +729,7 @@ for idx, m_key in enumerate(all_models):
         st.markdown(f"**{model_labels[m_key]}**")
         rows = []
         for h in horizons:
-            data = _fetch_prediction(m_key, h) if _flask_reachable else None
+            data = _fetch_prediction(m_key, h)
             if data:
                 rows.append((h, data["aqi_prediction"], get_epa_tier_details(data["aqi_prediction"])))
 
@@ -782,8 +782,6 @@ _LAYOUT = dict(
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def _fetch_all_metrics(gateway: str) -> tuple[dict, str | None]:
-    if not _flask_reachable:
-        return {}, "Flask API is offline."
     r = _api_get(gateway, "/metrics/all", timeout=(15, 60))
     if r is None:
         return {}, "Cannot reach Flask API for metrics."
@@ -947,9 +945,6 @@ def _fetch_shap_or_coef(gateway: str, model_key: str, horizon: int) -> tuple[lis
     Returns (records, value_label) where value_label is used in the chart title.
     Falls back from SHAP → coefficient magnitudes for Ridge.
     """
-    if not _flask_reachable:
-        return [], "Mean |SHAP|"
-
     # Stage 1: SHAP (works for RF and XGBoost)
     r = _api_get(gateway, f"/shap/{model_key}/{horizon}", timeout=(10, 30))
     if r and r.status_code == 200:
@@ -1124,8 +1119,6 @@ st.caption(
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def _fetch_band_errors(gateway: str) -> pd.DataFrame:
-    if not _flask_reachable:
-        return pd.DataFrame()
     r = _api_get(gateway, "/debug/metrics_raw", timeout=(10, 30))
     if not r or r.status_code != 200:
         return pd.DataFrame()
