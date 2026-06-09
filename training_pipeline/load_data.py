@@ -93,8 +93,17 @@ def _fetch_from_feature_store() -> pd.DataFrame:
     for col in _EXCLUDE_COLS:
         projection[col] = 0
 
+    # Date filter: only fetch last 2 years of data.
+    # ~33k rows exist since 2022 — fetching all is too slow on Atlas M0.
+    # 2 years (~17,500 rows) is sufficient — data only goes back to Aug 2022 anyway.
+    from datetime import datetime, timedelta
+    cutoff_dt = datetime.utcnow() - timedelta(days=730)
+    cutoff_str = cutoff_dt.strftime("%Y-%m-%d %H:%M:%S")
+    query = {"timestamp": {"$gte": cutoff_str}}
+
     print(f"Connecting to feature warehouse: {DB_NAME}.{COLLECTION_NAME}", flush=True)
     print(f"  Projection excludes {len(_EXCLUDE_COLS)} leakage/redundant columns to reduce payload.", flush=True)
+    print(f"  Date filter: fetching rows >= {cutoff_str} (~2yr window, ~17k rows).", flush=True)
     try:
         client = MongoClient(
             MONGO_URI,
@@ -107,7 +116,7 @@ def _fetch_from_feature_store() -> pd.DataFrame:
 
         # batch_size(500) prevents a single oversized read that exceeds the
         # 120s socket timeout on large collections (>10k docs).
-        cursor = db[COLLECTION_NAME].find({}, projection).batch_size(500)
+        cursor = db[COLLECTION_NAME].find(query, projection).batch_size(500)
         documents = list(cursor)
         client.close()
     except PyMongoError as e:
