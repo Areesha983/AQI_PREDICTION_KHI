@@ -48,6 +48,18 @@ FIX-PAYLOAD-KEYS  inference_payload used "pm25_diff_1h" and "pm25_roll_std_24h"
                   writes "pm25_change_24h" and "pm25_roll_std_24" (no "h").
                   Corrected to the actual column names so the API receives real
                   values from the feature doc rather than zeros.
+
+FIX-REACHABLE-GUARD  _flask_reachable was evaluated once at module load time.
+                  If Render happened to be mid-restart at that exact moment,
+                  every @st.cache_data function that checked `if not
+                  _flask_reachable: return` short-circuited forever until the
+                  TTL expired — even though the API came back up seconds later.
+                  Removed the guard from _fetch_all_metrics, _fetch_shap_or_coef,
+                  _fetch_band_errors, and _fetch_skill_data.  These functions
+                  now always attempt the HTTP call and surface real errors.
+                  _flask_reachable is still used for the header badge and the
+                  inference gauges (Sections 1 & 2) where a fast fail is
+                  acceptable UX.
 """
 
 import time
@@ -624,7 +636,7 @@ inference_payload = {
         "humidity":                      sim_humidity,
         "wind_speed":                    sim_wind,
         "pm25_change_24h":               _d(mongo_features, "pm25_change_24h",  "pm25_change_24h",  0.0),
-        "pm25_roll_std_24":              _d(mongo_features, "pm25_roll_std_24",  "pm25_roll_std_24",  0.0),
+        "pm25_roll_std_24":              _d(mongo_features, "pm25_roll_std_24",  "pm25_roll_std_24", 0.0),
         "interaction_pm25_humidity":     sim_pm25 * sim_humidity,
         "interaction_pm25_wind_inverse": sim_pm25 / (sim_wind + 0.1),
     }
@@ -648,15 +660,17 @@ with _warmup_placeholder.container():
 _warmup_placeholder.empty()
 
 if not _flask_reachable:
-    st.error(
-        f"**Cannot reach Flask API at `{api_gateway}`.**\n\n"
-        "The Render service may be completely down, or the URL is wrong.  "
-        "Predictions and metrics require a live connection."
+    st.warning(
+        f"**Flask API at `{api_gateway}` did not respond to /health.**\n\n"
+        "Render may still be waking up — metrics and SHAP charts will attempt "
+        "the API directly and display data if it comes back.  "
+        "Inference gauges (Sections 1 & 2) require a live connection."
     )
 
 
 # ─── Single-horizon prediction helper ────────────────────────────────────────
 def _fetch_prediction(model_key: str, horizon: int) -> dict | None:
+    """Only used for live inference gauges — fast-fail is acceptable here."""
     if not _flask_reachable:
         return None
     r = _api_post(api_gateway, f"/predict/{model_key}/{horizon}", inference_payload)
@@ -671,7 +685,7 @@ def _fetch_prediction(model_key: str, horizon: int) -> dict | None:
 api_badge = (
     '<span class="status-badge badge-live">● API LIVE</span>'
     if _flask_reachable
-    else '<span class="status-badge badge-dead">● API OFFLINE</span>'
+    else '<span class="status-badge badge-warn">● API WARMING</span>'
 )
 st.markdown(f"""
 <div style="display:flex; justify-content:space-between; align-items:flex-start;
@@ -831,8 +845,14 @@ for idx, m_key in enumerate(["random_forest", "xgboost", "ridge"]):
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def _fetch_all_metrics(gateway: str) -> tuple[dict, str | None]:
-    if not _flask_reachable:
-        return {}, "Flask API is offline."
+    """
+    FIX-REACHABLE-GUARD: removed `if not _flask_reachable` early return.
+    The guard caused all metric/SHAP/band charts to stay blank for up to
+    30 min if Render happened to be mid-restart when the page first loaded,
+    because _flask_reachable is evaluated once at module load time and the
+    cached False value was reused on every subsequent rerender.
+    This function now always attempts the HTTP call and surfaces real errors.
+    """
     r = _api_get(gateway, "/metrics/all", timeout=(15, 60))
     if r is None:
         return {}, "Cannot reach Flask API for metrics."
@@ -995,6 +1015,8 @@ def _fetch_shap_or_coef(
 ) -> tuple[list[dict], str]:
     """
     FIX-SHAP-RIDGE: two-stage fetch.
+    FIX-REACHABLE-GUARD: removed `if not _flask_reachable` early return —
+    same reasoning as _fetch_all_metrics.
 
     Stage 1 — /shap/<model>/<horizon>  (model_shap, populated for RF + XGBoost)
     Stage 2 — /features/<model>/<horizon>  (model_features, Ridge |coefficient|)
@@ -1003,9 +1025,6 @@ def _fetch_shap_or_coef(
       {"feature": str, "mean_abs_shap": float}
     so the chart code below needs no changes.
     """
-    if not _flask_reachable:
-        return [], "Mean |SHAP|"
-
     r = _api_get(gateway, f"/shap/{model_key}/{horizon}", timeout=(10, 30))
     if r and r.status_code == 200:
         try:
@@ -1093,6 +1112,10 @@ def _fetch_skill_data(gateway: str, raw_metrics: dict) -> list[dict]:
     moment, the function always returned an empty list on subsequent calls.
     Now takes raw_metrics as an explicit argument so the cached result is
     always computed from the data that was actually passed in.
+
+    FIX-REACHABLE-GUARD: removed `if not _flask_reachable` early return.
+    raw_metrics is already fetched by _fetch_all_metrics (which has its own
+    error handling) — no need to gate on _flask_reachable here.
     """
     rows = []
     for api_key, display_name in _MODEL_NAME_MAP.items():
@@ -1170,7 +1193,7 @@ if skill_rows:
                                  title=dict(text="AQI units",
                                             font=dict(color=_TEXT_COLOR, size=11)))
         st.plotly_chart(fig_margin, use_container_width=True, config={"displayModeBar": False})
-elif _flask_reachable:
+elif not _raw_metrics:
     st.info("Skill and coverage data will appear here after the training pipeline runs.")
 
 
@@ -1202,8 +1225,11 @@ _BAND_COLORS = {
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def _fetch_band_errors(gateway: str) -> pd.DataFrame:
-    if not _flask_reachable:
-        return pd.DataFrame()
+    """
+    FIX-REACHABLE-GUARD: removed `if not _flask_reachable` early return.
+    Same reasoning as _fetch_all_metrics — the cached False from a cold-start
+    would permanently suppress this chart for the TTL window.
+    """
     r = _api_get(gateway, "/debug/metrics_raw", timeout=(10, 30))
     if not r or r.status_code != 200:
         return pd.DataFrame()
@@ -1283,7 +1309,7 @@ if not band_df.empty:
                 ),
             )
             st.plotly_chart(fig_b, use_container_width=True, config={"displayModeBar": False})
-elif _flask_reachable:
+else:
     st.info(
         "Band-level MAE will appear here automatically — the training pipeline "
         "stores `error_by_band` inside each `model_metrics` document.  "
