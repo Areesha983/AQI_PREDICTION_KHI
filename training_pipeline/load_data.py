@@ -78,7 +78,7 @@ def _fetch_from_feature_store() -> pd.DataFrame:
 
     print(f"Connecting to feature warehouse: {DB_NAME}.{COLLECTION_NAME}", flush=True)
     try:
-        client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000, socketTimeoutMS=45000)
+        client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000, socketTimeoutMS=120000)
         db = client[DB_NAME]
         
         cursor = db[COLLECTION_NAME].find({}, {"_id": 0})
