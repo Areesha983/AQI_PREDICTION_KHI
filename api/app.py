@@ -5,25 +5,30 @@ api/app.py
 
 KEY FIXES IN THIS VERSION
 ──────────────────────────
-FIX 1 — METRICS PATH SIMPLIFIED
-FIX 2 — MODEL-AWARE FEATURE VECTOR (_build_feature_vector)
-FIX 3 — PREDICT ROUTE WIRED TO FIXED BUILDER
-FIX 4 — NAMING CONSISTENCY
-FIX 5 — RANDOM FOREST GUNICORN DEADLOCK
-FIX 6 — XGBOOST RESIDUAL CORRECTOR APPLIED AT INFERENCE
-FIX 7 — FULL TRACEBACK LOGGED ON PREDICT FAILURE
-FIX 8 — RIDGE FEATURE IMPORTANCE ROUTE (NEW)
-FIX 9 — /features/ ROUTE NULL-GUARD + INDEX MAP CORRECTED (NEW)
+FIX 1  — METRICS PATH SIMPLIFIED
+FIX 2  — MODEL-AWARE FEATURE VECTOR (_build_feature_vector)
+FIX 3  — PREDICT ROUTE WIRED TO FIXED BUILDER
+FIX 4  — NAMING CONSISTENCY
+FIX 5  — RANDOM FOREST GUNICORN DEADLOCK
+FIX 6  — XGBOOST RESIDUAL CORRECTOR APPLIED AT INFERENCE
+FIX 7  — FULL TRACEBACK LOGGED ON PREDICT FAILURE
+FIX 8  — RIDGE FEATURE IMPORTANCE ROUTE (NEW)
+FIX 9  — /features/ ROUTE NULL-GUARD + INDEX MAP CORRECTED (NEW)
 FIX 10 — DEAD _get_latest_metrics_doc STUB REMOVED (NEW)
 FIX 11 — MODEL_CACHE TTL (1 hour) so stale artifacts auto-expire after retraining
 FIX 12 — _build_feature_vector always applies lag1_overrides via base.update()
-          instead of only updating keys already present in base. Prevents 0-valued
-          features when the feature doc is stale or missing a lag column.
 FIX 13 — /debug/feature_mismatch/<model>/<horizon> route added for diagnostics.
-FIX 14 — Background warmup thread pre-loads all 9 model artifacts from GridFS at
-          startup so the first /predict call hits the in-memory cache instead of
-          blocking the sync worker on a cold GridFS download (which caused the
-          30s/120s worker timeout death-loop on Render free tier).
+FIX 14 — Background warmup thread pre-loads Ridge + XGBoost at startup.
+          Random Forest is intentionally EXCLUDED from warmup — its GridFS
+          artifact is large enough that downloading it in a background thread
+          during --preload caused the gunicorn worker to timeout (SIGKILL) before
+          the transfer completed (socketTimeoutMS 120 s < RF download time).
+          RF is loaded lazily on the first /predict/random_forest/<h> call.
+FIX 15 — socketTimeoutMS raised to 300_000 ms (5 min) in _mongo_client() to
+          match gunicorn --timeout 300. This allows large RF GridFS transfers to
+          complete without hitting a mid-transfer socket timeout. Root cause of:
+            [warmup] ✗ random_forest/24h failed: ... The read operation timed out
+            [CRITICAL] WORKER TIMEOUT (pid:63)
 """
 
 import os
@@ -64,8 +69,8 @@ CORS(app)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 MODEL_CACHE     : dict = {}
-MODEL_CACHE_TS  : dict = {}          # FIX 11: timestamps for TTL enforcement
-MODEL_CACHE_TTL : int  = 3600        # FIX 11: 1-hour TTL — auto-expires after retraining
+MODEL_CACHE_TS  : dict = {}
+MODEL_CACHE_TTL : int  = 3600        # 1-hour TTL — auto-expires after retraining
 VALID_MODELS    = ["random_forest", "xgboost", "ridge"]
 VALID_HORIZONS  = {24, 48, 72}
 
@@ -95,7 +100,12 @@ _METRIC_ALIASES: dict[str, list[str]] = {
 def _mongo_client() -> MongoClient:
     if not MONGO_URI:
         raise ValueError("MONGODB_URI is not set in environment / .env")
-    return MongoClient(MONGO_URI, serverSelectionTimeoutMS=10_000, socketTimeoutMS=120_000)
+    # FIX 15: socketTimeoutMS=300_000 (5 min) matches gunicorn --timeout 300.
+    # The previous 120_000 ms limit caused large Random Forest GridFS downloads
+    # to hit "The read operation timed out" mid-transfer, which then triggered
+    # the background warmup thread to keep the worker busy past its timeout,
+    # resulting in WORKER TIMEOUT → SIGKILL → restart loop on Render free tier.
+    return MongoClient(MONGO_URI, serverSelectionTimeoutMS=10_000, socketTimeoutMS=300_000)
 
 
 def _extract_metric(doc: dict, key: str) -> float:
@@ -207,10 +217,6 @@ def _build_feature_vector(artifact: dict, slider_overrides: dict) -> pd.DataFram
         "humidity_to_wind_ratio":        hum  / (wind + 0.1),
     }
 
-    # FIX 12: use base.update() — always write lag overrides regardless of
-    # whether the key already exists in base. The old `if k in base` guard
-    # caused 0-valued features when the feature doc was stale or missing a
-    # lag column, which made XGBoost predict ~0 on near-zero inputs.
     base.update(lag1_overrides)
 
     if use_interactions and interaction_cols:
@@ -219,7 +225,6 @@ def _build_feature_vector(artifact: dict, slider_overrides: dict) -> pd.DataFram
 
     row = {f: _safe_float(base.get(f), 0.0) for f in expected_features}
 
-    # Warn when many features are defaulting to 0 (signals stale feature doc)
     zero_count = sum(1 for v in row.values() if v == 0.0)
     if zero_count > len(expected_features) * 0.25:
         missing = [f for f in expected_features if base.get(f) is None or base.get(f) == 0.0]
@@ -237,7 +242,6 @@ def load_prediction_artifacts(model_type: str, horizon: int) -> dict:
     cache_key = f"{model_type}_{horizon}"
     now = time.time()
 
-    # FIX 11: honour TTL — reload artifact after 1 hour so retraining takes effect
     if cache_key in MODEL_CACHE and (now - MODEL_CACHE_TS.get(cache_key, 0)) < MODEL_CACHE_TTL:
         return MODEL_CACHE[cache_key]
 
@@ -266,30 +270,37 @@ def load_prediction_artifacts(model_type: str, horizon: int) -> dict:
     return artifact
 
 
-# ── FIX 14: Background model warmup ──────────────────────────────────────────
+# ── FIX 14 + 15: Background model warmup (Ridge + XGBoost only) ──────────────
 def _warmup_models() -> None:
     """
-    Pre-load all 9 model artifacts from GridFS into MODEL_CACHE at startup.
-    Runs in a background daemon thread so the worker becomes available
-    immediately and can serve /health, /metrics, /latest_realtime while
-    models are loading in the background.
+    Pre-loads Ridge and XGBoost artifacts (6 total) from GridFS into MODEL_CACHE
+    at startup. Runs in a background daemon thread.
 
-    This prevents the first /predict call from blocking the sync worker for
-    the full GridFS download duration — which caused the 30s/120s worker
-    timeout death-loop on Render free tier where cold GridFS reads of large
-    RF/XGBoost pickle files exceeded gunicorn's worker timeout.
+    Random Forest is intentionally EXCLUDED from warmup (FIX 14).
+    The RF GridFS artifact is large enough that downloading it in a background
+    thread during gunicorn --preload caused the sync worker to be killed:
 
-    By the time Streamlit makes its first /predict call the models are already
-    in MODEL_CACHE and the response is instant.
+      Step 1 — warmup thread calls load_model_artifact("RandomForest", 24)
+      Step 2 — GridFS read starts; transfer takes > 120 s (old socketTimeoutMS)
+      Step 3 — transfer hit "The read operation timed out" at 120 s
+      Step 4 — thread retried / stalled; worker stayed busy past --timeout 300
+      Step 5 — gunicorn sent SIGKILL → restart loop on Render free tier
+
+    With FIX 15 (socketTimeoutMS=300_000) the socket timeout is resolved, but
+    RF is still excluded from warmup as a belt-and-suspenders measure: the sync
+    worker must never be blocked by a background thread doing I/O. RF artifacts
+    are loaded lazily on the first /predict/random_forest/<h> call instead.
+    Users making RF predictions will experience a one-time cold-start delay
+    (~30-90 s depending on Render network) on the first call; subsequent calls
+    hit the in-memory cache instantly.
     """
-    def _load_all():
-        print("[warmup] Starting background model pre-load ...", flush=True)
-        # Load Ridge first (smallest, fastest) so at least one model is ready
-        # quickly, then RF and XGBoost (larger artifacts).
+    def _load_fast_models():
+        print("[warmup] Starting background pre-load (Ridge + XGBoost only) ...", flush=True)
+        # Ridge first (smallest/fastest), then XGBoost.
+        # Random Forest is intentionally skipped — see docstring above.
         load_order = [
-            ("ridge",         24), ("ridge",         48), ("ridge",         72),
-            ("xgboost",       24), ("xgboost",       48), ("xgboost",       72),
-            ("random_forest", 24), ("random_forest", 48), ("random_forest", 72),
+            ("ridge",   24), ("ridge",   48), ("ridge",   72),
+            ("xgboost", 24), ("xgboost", 48), ("xgboost", 72),
         ]
         for model_type, horizon in load_order:
             try:
@@ -297,9 +308,13 @@ def _warmup_models() -> None:
                 print(f"[warmup] ✓ {model_type}/{horizon}h cached", flush=True)
             except Exception as e:
                 print(f"[warmup] ✗ {model_type}/{horizon}h failed: {e}", flush=True)
-        print("[warmup] Background pre-load complete.", flush=True)
+        print(
+            "[warmup] Pre-load complete (Ridge + XGBoost). "
+            "Random Forest will load lazily on first /predict call.",
+            flush=True,
+        )
 
-    t = threading.Thread(target=_load_all, daemon=True, name="model-warmup")
+    t = threading.Thread(target=_load_fast_models, daemon=True, name="model-warmup")
     t.start()
 
 
@@ -648,7 +663,7 @@ def debug_artifacts():
 
 @app.route("/debug/feature_mismatch/<string:model_type>/<int:horizon>", methods=["GET"])
 def debug_feature_mismatch(model_type: str, horizon: int):
-    """FIX 13: Shows exactly which features the artifact expects but the feature doc is missing."""
+    """Shows exactly which features the artifact expects but the feature doc is missing."""
     model_type = model_type.lower()
     if model_type not in VALID_MODELS:
         return jsonify({"error": f"Invalid model. Choose from: {VALID_MODELS}"}), 400
@@ -676,7 +691,7 @@ def debug_feature_mismatch(model_type: str, horizon: int):
         return jsonify({"error": str(e)}), 500
 
 
-# ── FIX 14: Kick off background warmup when gunicorn imports this module ─────
+# ── Kick off background warmup when gunicorn imports this module ──────────────
 _warmup_models()
 
 if __name__ == "__main__":

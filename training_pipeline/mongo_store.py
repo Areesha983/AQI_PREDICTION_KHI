@@ -58,7 +58,7 @@ def get_db():
     uri = os.getenv("MONGODB_URI")
     if not uri:
         raise ValueError("MONGODB_URI environment variable is not set.")
-    _CLIENT = MongoClient(uri, serverSelectionTimeoutMS=10_000, socketTimeoutMS=120_000)
+    _CLIENT = MongoClient(uri, serverSelectionTimeoutMS=10_000, socketTimeoutMS=300_000)
     _DB = _CLIENT["karachi_aqi"]
     _FS = gridfs.GridFS(_DB, collection="model_fs")
     return _DB
