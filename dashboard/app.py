@@ -1,42 +1,53 @@
 """
-AirLyst Karachi — AQI Intelligence Dashboard  (v6)
-Streamlit frontend consuming a Flask prediction microservice on Render.
+AirWind Karachi — AQI Intelligence Dashboard
+Streamlit frontend consuming the Flask prediction microservice on Render.
+dashboard/app.py
 
-FIXES vs v5
-───────────
-FIX-SHAP-RIDGE  Ridge never calls save_shap() — it has no TreeExplainer and
-                stores coefficient magnitudes via save_feature_list() into the
-                model_features collection, NOT model_shap.  The previous
-                _fetch_shap() only queried /shap/<model>/<horizon>, which reads
-                model_shap → always empty for Ridge → "SHAP data not yet
-                available" message forever.
+CONSOLIDATED CHANGE LOG
+────────────────────────
+FIX-SHAP-RIDGE    Ridge stores coefficient magnitudes via save_feature_list()
+                  into model_features, NOT model_shap (no TreeExplainer).
+                  _fetch_shap_or_coef() tries /shap/ first, falls back to
+                  /features/ — both return identical record format so the
+                  bar-chart code needs zero changes.  Chart title updated to
+                  show "Mean |Coefficient|" for Ridge.
 
-                Fix (two-part):
-                  1. New _fetch_shap_or_coef() helper: tries /shap first; if
-                     records come back empty it calls the new
-                     /features/<model>/<horizon> route (see api/app.py patch)
-                     which reads model_features and returns the top-10 features
-                     by |coefficient|, formatted identically to SHAP records
-                     {"feature": ..., "mean_abs_shap": ...} so the bar-chart
-                     code needs zero changes.
-                  2. Chart title updated to show "Mean |Coeff|" label for Ridge
-                     so the user knows what they're looking at.
+FIX-TIMESTAMP     realtime_observations timestamps are already PKT (Open-Meteo
+                  called with &timezone=Asia%2FKarachi); processed_features
+                  stores UTC.  _to_karachi_str(already_pkt=) handles both
+                  sources correctly.  Prevents the "5 h ahead of wall clock"
+                  display bug.
 
-FIX-TIMESTAMP   MongoDB stores all datetimes in UTC.  Karachi is UTC+5.
-                The sidebar showed the raw UTC string from the document
-                (e.g. "2026-06-07 23:00") which appeared 5 h ahead of wall
-                clock.  Fix: parse the string and offset by +5 h before
-                rendering.  Handles both ISO ("T") and space-separated formats.
-                Falls back gracefully if parsing fails.
+FIX-LIVE-DATA     mongo_features is now rebuilt inside the sidebar block on
+                  every Streamlit rerender from the (possibly fresh) cached
+                  fetch result.  The old module-level dict was populated once
+                  at import time and never updated across rerenders.
 
-FIX-LIVE-DATA   The module-level mongo_features dict was populated once at
-                import time from the @st.cache_data return value, but on
-                subsequent Streamlit rerenders the dict object was not
-                re-populated because Python module state persists across
-                rerenders.  Fix: mongo_features is now rebuilt inside the
-                sidebar block on every rerender from the (possibly fresh)
-                cached fetch result, matching what the user actually sees in
-                the "As of:" timestamp.
+FIX-WARMUP        _warm_up_render() is a single fast attempt (5 s connect /
+                  10 s read, no retries).  It is cached at ttl=300 s so it
+                  does not re-block the UI on every rerender.  The old version
+                  had blocking retry loops inside the health check itself.
+
+FIX-POST-TIMEOUT  _api_post() read timeout raised 60 → 120 s so the first RF
+                  predict call (lazy GridFS load, up to 90 s on Render free
+                  tier) does not time out client-side before the server responds.
+
+FIX-SKILL-CACHE   _fetch_skill_data() previously ignored its `gateway` param
+                  and read _raw_metrics from outer scope — the cache key was
+                  correct but the function body was broken if _raw_metrics was
+                  empty when the cache was first populated.  Fixed to read from
+                  the explicitly passed metrics dict.
+
+FIX-BAND-NAMES    Section 6 hardcoded model names ("RandomForest", "XGBoost",
+                  "Ridge") as string literals instead of using _model_name_map.
+                  Now reads from the shared map so a rename in one place
+                  propagates everywhere.
+
+FIX-PAYLOAD-KEYS  inference_payload used "pm25_diff_1h" and "pm25_roll_std_24h"
+                  which do not exist in the feature store — feature_engineering.py
+                  writes "pm25_change_24h" and "pm25_roll_std_24" (no "h").
+                  Corrected to the actual column names so the API receives real
+                  values from the feature doc rather than zeros.
 """
 
 import time
@@ -135,16 +146,14 @@ h1, h2, h3 { font-family: var(--font-display) !important; color: var(--text-prim
 .stMarkdown h3 { font-size: 1rem !important; font-weight: 600 !important; }
 
 .js-plotly-plot .plotly { background: transparent !important; }
-
 hr { border-color: var(--border) !important; margin: 2rem 0 !important; }
 
 #MainMenu { visibility: hidden; }
-footer { visibility: hidden; }
-[data-testid="collapsedControl"] { visibility: visible !important; display: block !important; }
-[data-testid="stSidebarCollapsedControl"] { visibility: visible !important; display: block !important; }
+footer    { visibility: hidden; }
+[data-testid="collapsedControl"]              { visibility: visible !important; display: block !important; }
+[data-testid="stSidebarCollapsedControl"]     { visibility: visible !important; display: block !important; }
 section[data-testid="stSidebarCollapsedControl"] { visibility: visible !important; }
 
-/* Status badge */
 .status-badge {
     display: inline-block;
     padding: 3px 10px;
@@ -154,21 +163,10 @@ section[data-testid="stSidebarCollapsedControl"] { visibility: visible !importan
     font-weight: 600;
     letter-spacing: 0.05em;
 }
-.badge-live   { background: rgba(16,185,129,0.12); color: #10b981; border: 1px solid rgba(16,185,129,0.3); }
-.badge-warn   { background: rgba(245,158,11,0.12); color: #f59e0b; border: 1px solid rgba(245,158,11,0.3); }
-.badge-dead   { background: rgba(239,68,68,0.10);  color: #ef4444; border: 1px solid rgba(239,68,68,0.2); }
+.badge-live { background: rgba(16,185,129,0.12); color: #10b981; border: 1px solid rgba(16,185,129,0.3); }
+.badge-warn { background: rgba(245,158,11,0.12); color: #f59e0b; border: 1px solid rgba(245,158,11,0.3); }
+.badge-dead { background: rgba(239,68,68,0.10);  color: #ef4444; border: 1px solid rgba(239,68,68,0.2); }
 
-/* Section header */
-.section-label {
-    font-size: 0.65rem;
-    font-family: var(--font-mono);
-    color: #475569;
-    text-transform: uppercase;
-    letter-spacing: 0.12em;
-    margin-bottom: 0.25rem;
-}
-
-/* Read-only sensor card */
 .sensor-card {
     background: rgba(255,255,255,0.03);
     border: 1px solid rgba(255,255,255,0.07);
@@ -190,25 +188,71 @@ section[data-testid="stSidebarCollapsedControl"] { visibility: visible !importan
     font-family: 'JetBrains Mono', monospace;
     margin-top: 2px;
 }
-.sensor-unit {
-    font-size: 0.7rem;
-    color: #64748b;
-    margin-left: 3px;
-}
+.sensor-unit { font-size: 0.7rem; color: #64748b; margin-left: 3px; }
 </style>
 """, unsafe_allow_html=True)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  ROBUST API LAYER  —  handles Render cold-starts and 502s gracefully
-# ═══════════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
+#  CONSTANTS
+# ═════════════════════════════════════════════════════════════════════════════
 
 _MAX_RETRIES  = 3
-_BACKOFF_BASE = 2
+_BACKOFF_BASE = 2   # seconds; doubles each retry
 
+_KARACHI_OFFSET = timedelta(hours=5)
+
+_MODEL_NAME_MAP = {
+    "random_forest": "Random Forest",
+    "xgboost":       "XGBoost",
+    "ridge":         "Ridge",
+}
+# Maps the MongoDB model name (used in band data) back to the display name
+# so Section 6 doesn't need its own hardcoded dict.
+_MONGO_TO_DISPLAY = {
+    "RandomForest": "Random Forest",
+    "XGBoost":      "XGBoost",
+    "Ridge":        "Ridge",
+}
+
+_MODEL_COLORS = {
+    "Random Forest": "#3b82f6",
+    "XGBoost":       "#10b981",
+    "Ridge":         "#f59e0b",
+}
+_TRANSPARENT = "rgba(0,0,0,0)"
+_GRID_COLOR  = "rgba(255,255,255,0.06)"
+_TEXT_COLOR  = "#94a3b8"
+_FONT        = "JetBrains Mono, monospace"
+
+_LAYOUT = dict(
+    plot_bgcolor  = _TRANSPARENT,
+    paper_bgcolor = _TRANSPARENT,
+    font          = dict(color=_TEXT_COLOR, family=_FONT, size=11),
+    margin        = dict(l=10, r=10, t=48, b=10),
+    legend        = dict(
+        bgcolor="rgba(255,255,255,0.03)",
+        bordercolor="rgba(255,255,255,0.08)",
+        borderwidth=1,
+        font=dict(color="#cbd5e1", size=10),
+    ),
+)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  ROBUST API LAYER — handles Render cold-starts and 502s gracefully
+# ═════════════════════════════════════════════════════════════════════════════
 
 def _warm_up_render(gateway: str) -> bool:
-    """Single fast health check — no blocking retries."""
+    """
+    Single fast health-check ping — no blocking retry loop.
+
+    FIX-WARMUP: The old version retried inside here with exponential backoff,
+    blocking the Streamlit render thread for up to 14 s on failure.  A single
+    tight attempt is enough — Render wakes up on the first request anyway, and
+    subsequent _api_get / _api_post calls have their own retry logic.  This
+    function is cached at ttl=300 s so it does not re-ping on every rerender.
+    """
     try:
         r = requests.get(f"{gateway}/health", timeout=(5, 10))
         return r.status_code == 200
@@ -232,13 +276,18 @@ def _api_get(gateway: str, path: str, timeout: tuple = (15, 45)) -> requests.Res
     return None
 
 
-def _api_post(gateway: str, path: str, payload: dict, timeout: tuple = (15, 120)) -> requests.Response | None:
+def _api_post(
+    gateway: str,
+    path: str,
+    payload: dict,
+    timeout: tuple = (15, 120),
+) -> requests.Response | None:
     """
-    FIX: read timeout raised 60 → 120 s.
-    Random Forest artifacts load lazily on first /predict call (GridFS download
+    FIX-POST-TIMEOUT: read timeout raised 60 → 120 s.
+    Random Forest loads lazily on the first /predict call (GridFS download
     can take 30-90 s on Render free tier).  The old 60 s read timeout caused
-    the first RF prediction request to time out mid-transfer and return None,
-    showing blank gauges even though the API was working correctly.
+    the first RF request to time out client-side even though the server was
+    working correctly, producing blank gauges.
     """
     for attempt in range(_MAX_RETRIES):
         try:
@@ -255,11 +304,11 @@ def _api_post(gateway: str, path: str, payload: dict, timeout: tuple = (15, 120)
     return None
 
 
-# ─── Feature fetchers ─────────────────────────────────────────────────────────
+# ─── Feature fetchers ──────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=60)
 def _load_realtime_features(gateway: str) -> tuple[dict, bool, str | None]:
-    """Fetches from realtime_observations (today's partial data)."""
+    """Fetch the most recent document from realtime_observations."""
     r = _api_get(gateway, "/latest_realtime", timeout=(10, 20))
     if r is None:
         return {}, False, f"Cannot reach Flask API at {gateway}."
@@ -273,7 +322,7 @@ def _load_realtime_features(gateway: str) -> tuple[dict, bool, str | None]:
 
 @st.cache_data(ttl=300)
 def _load_processed_features(gateway: str) -> tuple[dict, bool, str | None]:
-    """Fetches from processed_features (yesterday's finalised data)."""
+    """Fetch the most recent document from processed_features (yesterday's data)."""
     r = _api_get(gateway, "/latest_features", timeout=(10, 20))
     if r is None:
         return {}, False, f"Cannot reach Flask API at {gateway}."
@@ -296,9 +345,11 @@ def _safe_float(v, default: float = 0.0) -> float:
 
 def _d(features: dict, raw_key: str, lag_key: str, default: float) -> float:
     """
-    FIX-LIVE-DATA: now takes the features dict explicitly rather than reading
-    from a stale module-level variable, so every Streamlit rerender uses the
-    latest fetched values.
+    Resolve a sensor value from the features dict.
+    Tries lag_key first (processed_features schema), then raw_key (realtime schema).
+
+    FIX-LIVE-DATA: takes features explicitly so every rerender uses the
+    current dict, not a stale module-level reference.
     """
     for k in (lag_key, raw_key):
         v = features.get(k)
@@ -310,30 +361,22 @@ def _d(features: dict, raw_key: str, lag_key: str, default: float) -> float:
     return default
 
 
-# ─── FIX-TIMESTAMP helper ─────────────────────────────────────────────────────
-_KARACHI_OFFSET = timedelta(hours=5)
+# ─── Timestamp helper ─────────────────────────────────────────────────────────
 
 def _to_karachi_str(raw_dt, already_pkt: bool = False) -> str | None:
     """
-    Convert a datetime value to a "YYYY-MM-DD HH:MM PKT" display string.
+    Convert a datetime value to "YYYY-MM-DD HH:MM PKT" for display.
 
-    Two sources feed this function and they use DIFFERENT timezone conventions:
+    SOURCE A — realtime_observations: Open-Meteo returns PKT strings directly
+      (called with &timezone=Asia%2FKarachi).  Pass already_pkt=True — no
+      offset is added.
 
-    SOURCE A — realtime_observations (update_realtime.py)
-      Open-Meteo is called with &timezone=Asia%2FKarachi so every timestamp
-      in the API response is already PKT (UTC+5).  The datetime string is
-      stored as-is into MongoDB, e.g. "2026-06-07 16:00:00" meaning 16:00 PKT.
-      Pass already_pkt=True — NO offset should be added.
+    SOURCE B — processed_features: stored as UTC.  Pass already_pkt=False
+      (default) — +5 h is applied to convert to PKT.
 
-    SOURCE B — processed_features (feature_engineering.py / feature_store.py)
-      The historical pipeline stores timestamps as UTC ISO strings.
-      Pass already_pkt=False (default) — add +5 h to convert to PKT.
-
-    Sanity check: if already_pkt=True and the parsed time is more than 2 h
-    in the future relative to current PKT wall clock, it means a future
-    forecast row slipped through the update_realtime.py filter (e.g. pipeline
-    ran at the top of the hour before the fix was deployed).  In that case the
-    timestamp is clamped and flagged so the user isn't misled.
+    Sanity check: if already_pkt=True and the timestamp is > 2 h in the
+    future relative to current PKT wall clock, a forecast row slipped through
+    the update_realtime.py filter.  The timestamp is returned with a ⚠️ flag.
     """
     if raw_dt is None:
         return None
@@ -342,43 +385,42 @@ def _to_karachi_str(raw_dt, already_pkt: bool = False) -> str | None:
     if isinstance(raw_dt, datetime):
         dt = raw_dt
     elif isinstance(raw_dt, str):
-        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S",
-                    "%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%d %H:%M:%S.%f"):
+        for fmt in (
+            "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%d %H:%M:%S.%f",
+        ):
             try:
                 dt = datetime.strptime(raw_dt[:26], fmt)
                 break
             except ValueError:
                 continue
         if dt is None:
-            # Unparseable — return truncated raw string rather than crashing
-            return str(raw_dt)[:16]
+            return str(raw_dt)[:16]  # unparseable — truncate rather than crash
 
     if already_pkt:
-        # Sanity check: realtime timestamps should never be more than 2 h ahead
-        # of current PKT wall clock.  If they are, a future forecast row slipped
-        # through — flag it so the user knows the data may be stale.
         now_pkt = datetime.utcnow() + _KARACHI_OFFSET
         if dt > now_pkt + timedelta(hours=2):
             return dt.strftime("%Y-%m-%d %H:%M PKT") + " ⚠️ (future)"
         return dt.strftime("%Y-%m-%d %H:%M PKT")
 
-    # Timestamp is UTC — add +5 h to convert to PKT
+    # UTC → PKT
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     karachi_dt = dt.astimezone(timezone.utc) + _KARACHI_OFFSET
     return karachi_dt.strftime("%Y-%m-%d %H:%M PKT")
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
 #  SIDEBAR
-# ═══════════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
 with st.sidebar:
     st.markdown("""
         <div style='margin-bottom:1.5rem;'>
             <span style='font-family:"Syne",sans-serif; font-size:1.3rem; font-weight:800; color:#f1f5f9;'>
                 Air<span style='color:#3b82f6;'>Wind</span>
             </span>
-            <div style='font-size:0.68rem; color:#334155; letter-spacing:0.1em; text-transform:uppercase; margin-top:2px;'>
+            <div style='font-size:0.68rem; color:#334155; letter-spacing:0.1em;
+                        text-transform:uppercase; margin-top:2px;'>
                 Karachi AQI Intelligence
             </div>
         </div>
@@ -404,24 +446,21 @@ with st.sidebar:
     st.markdown("---")
 
     # ── FIX-LIVE-DATA: rebuild mongo_features on every rerender ──────────────
-    # The old code populated a module-level dict once; subsequent rerenders saw
-    # stale values.  Now we always read from the (possibly fresh) cache result
-    # and build a local dict used throughout this rerender.
-    mongo_features: dict = {}
-    # Track whether the active timestamp is already PKT (realtime_observations)
-    # or UTC (processed_features) so _to_karachi_str applies the right conversion.
-    _dt_already_pkt: bool = False
+    mongo_features : dict = {}
+    _dt_already_pkt: bool = False   # tracks which source the active timestamp came from
 
-    realtime_data, realtime_ok, realtime_err = _load_realtime_features(api_gateway)
+    realtime_data,  realtime_ok,  realtime_err  = _load_realtime_features(api_gateway)
     processed_data, processed_ok, processed_err = _load_processed_features(api_gateway)
 
     def _parse_dt_pkt(doc: dict, already_pkt: bool) -> datetime | None:
-        """Parse a document's datetime field into a naive PKT datetime for comparison."""
+        """Parse a document's datetime field to a naive PKT datetime for freshness comparison."""
         raw = doc.get("datetime") or doc.get("timestamp")
         if not raw:
             return None
-        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S",
-                    "%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%d %H:%M:%S.%f"):
+        for fmt in (
+            "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%d %H:%M:%S.%f",
+        ):
             try:
                 dt = datetime.strptime(str(raw)[:26], fmt)
                 return dt if already_pkt else dt + _KARACHI_OFFSET
@@ -429,23 +468,20 @@ with st.sidebar:
                 pass
         return None
 
-    _now_pkt = datetime.utcnow() + _KARACHI_OFFSET
-
-    # Parse timestamps from both sources (both normalised to PKT for comparison)
-    _rt_dt_pkt  = _parse_dt_pkt(realtime_data,  already_pkt=True)  if realtime_ok  else None
+    _now_pkt     = datetime.utcnow() + _KARACHI_OFFSET
+    _rt_dt_pkt   = _parse_dt_pkt(realtime_data,  already_pkt=True)  if realtime_ok  else None
     _proc_dt_pkt = _parse_dt_pkt(processed_data, already_pkt=False) if processed_ok else None
 
-    # Discard any realtime row that is in the future (forecast row, not observation)
+    # Discard any realtime row timestamped in the future (forecast row, not observation)
     if _rt_dt_pkt and _rt_dt_pkt > _now_pkt + timedelta(minutes=5):
-        _rt_dt_pkt  = None
-        realtime_ok = False
+        _rt_dt_pkt   = None
+        realtime_ok  = False
         realtime_err = (
             f"Realtime timestamp is in the future "
-            f"(now PKT: {_now_pkt.strftime('%H:%M')}) — comparing with processed_features."
+            f"(now PKT: {_now_pkt.strftime('%H:%M')}) — falling back to processed_features."
         )
 
-    # Choose the FRESHEST valid source.
-    # A 2-hour-old realtime row beats a 3-day-old processed row.
+    # Use the freshest valid source (a 2 h-old realtime row beats a 3-day-old processed row)
     _use_realtime = (
         realtime_ok and _rt_dt_pkt is not None and (
             _proc_dt_pkt is None or _rt_dt_pkt >= _proc_dt_pkt
@@ -454,37 +490,47 @@ with st.sidebar:
 
     if _use_realtime:
         mongo_features.update(realtime_data)
-        data_source_label = "🟢 Live  <span style='color:#334155;font-size:0.65rem;'>(realtime_observations)</span>"
+        data_source_label = (
+            "🟢 Live  <span style='color:#334155;font-size:0.65rem;'>"
+            "(realtime_observations)</span>"
+        )
         mongo_active    = True
         mongo_error     = None
         _dt_already_pkt = True
     elif processed_ok:
         mongo_features.update(processed_data)
-        data_source_label = "🟡 Cached  <span style='color:#334155;font-size:0.65rem;'>(processed_features · T-1)</span>"
+        data_source_label = (
+            "🟡 Cached  <span style='color:#334155;font-size:0.65rem;'>"
+            "(processed_features · T-1)</span>"
+        )
         mongo_active    = True
         mongo_error     = realtime_err
         _dt_already_pkt = False
     elif realtime_ok:
-        # processed_features is unavailable but realtime exists (even if slightly stale)
         mongo_features.update(realtime_data)
-        data_source_label = "🟡 Cached  <span style='color:#334155;font-size:0.65rem;'>(realtime_observations · stale)</span>"
+        data_source_label = (
+            "🟡 Cached  <span style='color:#334155;font-size:0.65rem;'>"
+            "(realtime_observations · stale)</span>"
+        )
         mongo_active    = True
         mongo_error     = processed_err
         _dt_already_pkt = True
     else:
-        data_source_label = "🔴 Offline  <span style='color:#334155;font-size:0.65rem;'>(defaults)</span>"
+        data_source_label = (
+            "🔴 Offline  <span style='color:#334155;font-size:0.65rem;'>(defaults)</span>"
+        )
         mongo_active    = False
         mongo_error     = processed_err or realtime_err
         _dt_already_pkt = False
 
     # ── Resolve current sensor values ─────────────────────────────────────────
-    sim_pm25     = _d(mongo_features, "pm25",               "pm25_lag_1",        75.0)
-    sim_pm10     = _d(mongo_features, "pm10",               "pm10_lag_1",       140.0)
-    sim_temp     = _d(mongo_features, "temperature_2m",     "temperature_lag_1",  32.0)
-    sim_humidity = _d(mongo_features, "relative_humidity_2m", "humidity_lag_1",   65.0)
-    sim_wind     = _d(mongo_features, "wind_speed_10m",     "wind_speed_lag_1",   12.0)
+    sim_pm25     = _d(mongo_features, "pm25",                 "pm25_lag_1",        75.0)
+    sim_pm10     = _d(mongo_features, "pm10",                 "pm10_lag_1",       140.0)
+    sim_temp     = _d(mongo_features, "temperature_2m",       "temperature_lag_1",  32.0)
+    sim_humidity = _d(mongo_features, "relative_humidity_2m", "humidity_lag_1",     65.0)
+    sim_wind     = _d(mongo_features, "wind_speed_10m",       "wind_speed_lag_1",   12.0)
 
-    # ── Compute current AQI from PM2.5 ────────────────────────────────────────
+    # ── Compute current AQI from PM2.5 (EPA breakpoints) ─────────────────────
     def _pm25_to_aqi(pm25: float) -> int:
         bps = [
             (0.0,   12.0,  0,   50),
@@ -503,28 +549,24 @@ with st.sidebar:
     sim_aqi  = _pm25_to_aqi(sim_pm25)
     aqi_tier = get_epa_tier_details(sim_aqi)
 
-    # ── Read-only sensor display ──────────────────────────────────────────────
+    # ── Sensor display ────────────────────────────────────────────────────────
     st.markdown("##### 📡 Current Conditions")
 
-    # FIX-TIMESTAMP: pass already_pkt so realtime timestamps (already PKT from
-    # Open-Meteo) are NOT double-shifted, while processed_features (UTC) are
-    # correctly converted by +5 h.
-    _dt_raw = mongo_features.get("datetime") or mongo_features.get("timestamp")
+    _dt_raw   = mongo_features.get("datetime") or mongo_features.get("timestamp")
     _dt_local = _to_karachi_str(_dt_raw, already_pkt=_dt_already_pkt)
     if _dt_local:
         st.caption(f"As of: {_dt_local}")
     else:
         st.caption("Live values from feature store · read-only")
 
-    # AQI highlight card
     st.markdown(
         f"""<div style="
-                background: {aqi_tier['bg']};
-                border: 1px solid {aqi_tier['color']}44;
-                border-left: 3px solid {aqi_tier['color']};
-                border-radius: 10px;
-                padding: 12px 14px;
-                margin-bottom: 10px;">
+                background:{aqi_tier['bg']};
+                border:1px solid {aqi_tier['color']}44;
+                border-left:3px solid {aqi_tier['color']};
+                border-radius:10px;
+                padding:12px 14px;
+                margin-bottom:10px;">
             <div class="sensor-label">Current AQI</div>
             <div style="display:flex; align-items:baseline; gap:8px; margin-top:3px;">
                 <span style="font-size:2rem; font-weight:700; color:{aqi_tier['color']};
@@ -544,25 +586,26 @@ with st.sidebar:
         unsafe_allow_html=True,
     )
 
-    _sensor_rows = [
+    for _label, _val, _unit in [
         ("PM2.5",       sim_pm25,     "μg/m³"),
         ("PM10",        sim_pm10,     "μg/m³"),
         ("Temperature", sim_temp,     "°C"),
         ("Humidity",    sim_humidity, "%"),
         ("Wind Speed",  sim_wind,     "km/h"),
-    ]
-    for _label, _val, _unit in _sensor_rows:
+    ]:
         st.markdown(
             f"""<div class="sensor-card">
                     <div class="sensor-label">{_label}</div>
-                    <div class="sensor-value">{_val:.1f}<span class="sensor-unit">{_unit}</span></div>
+                    <div class="sensor-value">
+                        {_val:.1f}<span class="sensor-unit">{_unit}</span>
+                    </div>
                 </div>""",
             unsafe_allow_html=True,
         )
 
     st.markdown("---")
     st.markdown(
-        f"""<div style='font-size:0.72rem; color:#475569;'>{data_source_label}</div>""",
+        f"<div style='font-size:0.72rem; color:#475569;'>{data_source_label}</div>",
         unsafe_allow_html=True,
     )
     if mongo_error:
@@ -570,6 +613,9 @@ with st.sidebar:
 
 
 # ─── Inference payload ────────────────────────────────────────────────────────
+# FIX-PAYLOAD-KEYS: feature_engineering.py writes "pm25_roll_std_24" (no "h")
+# and "pm25_change_24h" — the previous keys "pm25_diff_1h" / "pm25_roll_std_24h"
+# do not exist in the feature store and always resolved to 0.
 inference_payload = {
     "features": {
         "pm25":                          sim_pm25,
@@ -577,26 +623,28 @@ inference_payload = {
         "temperature":                   sim_temp,
         "humidity":                      sim_humidity,
         "wind_speed":                    sim_wind,
-        "pm25_diff_1h":                  _d(mongo_features, "pm25_diff_1h",      "pm25_diff_1h",      0.0),
-        "pm25_roll_std_24h":             _d(mongo_features, "pm25_roll_std_24h", "pm25_roll_std_24h", 0.0),
+        "pm25_change_24h":               _d(mongo_features, "pm25_change_24h",  "pm25_change_24h",  0.0),
+        "pm25_roll_std_24":              _d(mongo_features, "pm25_roll_std_24",  "pm25_roll_std_24",  0.0),
         "interaction_pm25_humidity":     sim_pm25 * sim_humidity,
         "interaction_pm25_wind_inverse": sim_pm25 / (sim_wind + 0.1),
     }
 }
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  WARM-UP  —  show a progress spinner while Render wakes up
-# ═══════════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
+#  WARM-UP — spinner while Render wakes up
+# ═════════════════════════════════════════════════════════════════════════════
 @st.cache_data(ttl=300, show_spinner=False)
 def _check_api_live(gateway: str) -> bool:
     return _warm_up_render(gateway)
 
 _warmup_placeholder = st.empty()
 with _warmup_placeholder.container():
-    with st.spinner("⏳ Connecting to forecasting backend (Render may be waking from sleep — takes ~30 s)…"):
+    with st.spinner(
+        "⏳ Connecting to forecasting backend "
+        "(Render may be waking from sleep — takes ~30 s)…"
+    ):
         _flask_reachable = _check_api_live(api_gateway)
-
 _warmup_placeholder.empty()
 
 if not _flask_reachable:
@@ -612,29 +660,29 @@ def _fetch_prediction(model_key: str, horizon: int) -> dict | None:
     if not _flask_reachable:
         return None
     r = _api_post(api_gateway, f"/predict/{model_key}/{horizon}", inference_payload)
-    if r is None:
-        return None
-    if r.status_code == 200:
+    if r is not None and r.status_code == 200:
         return r.json()
     return None
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
 #  HEADER
-# ═══════════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
 api_badge = (
     '<span class="status-badge badge-live">● API LIVE</span>'
     if _flask_reachable
     else '<span class="status-badge badge-dead">● API OFFLINE</span>'
 )
 st.markdown(f"""
-<div style="display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:2rem;">
+<div style="display:flex; justify-content:space-between; align-items:flex-start;
+            margin-bottom:2rem;">
     <div>
         <h1 style="margin:0; font-size:2.4rem; font-weight:800; letter-spacing:-0.03em;
                    font-family:'Syne',sans-serif; color:#f1f5f9;">
             Air<span style="color:#3b82f6;">Wind</span> Karachi
         </h1>
-        <p style="margin:4px 0 0; color:#475569; font-size:0.82rem; font-family:'JetBrains Mono',monospace;">
+        <p style="margin:4px 0 0; color:#475569; font-size:0.82rem;
+                  font-family:'JetBrains Mono',monospace;">
             Multi-horizon AQI forecasting · Random Forest · XGBoost · Ridge
         </p>
     </div>
@@ -650,9 +698,9 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
 #  SECTION 1 — MULTI-HORIZON FORECAST GAUGES
-# ═══════════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
 st.markdown("### 🔮 Multi-Horizon Forecast")
 st.caption(f"Real-time predictions via **{selected_model_ui}** — 24 h · 48 h · 72 h windows")
 
@@ -667,13 +715,19 @@ for idx, h in enumerate(horizons):
         if data:
             pred = data["aqi_prediction"]
             tier = get_epa_tier_details(pred)
-            fig  = plot_aqi_gauge(pred, tier, f"{h}h Forecast")
-            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+            st.plotly_chart(
+                plot_aqi_gauge(pred, tier, f"{h}h Forecast"),
+                use_container_width=True,
+                config={"displayModeBar": False},
+            )
         else:
             st.markdown(
                 f"""<div class="card" style="text-align:center; padding:40px 20px;">
-                    <div style="font-size:0.75rem; color:#475569; font-family:'JetBrains Mono',monospace;">{h}h Forecast</div>
-                    <div style="font-size:1.1rem; color:#334155; margin-top:12px;">— unavailable —</div>
+                    <div style="font-size:0.75rem; color:#475569;
+                                font-family:'JetBrains Mono',monospace;">{h}h Forecast</div>
+                    <div style="font-size:1.1rem; color:#334155; margin-top:12px;">
+                        — unavailable —
+                    </div>
                 </div>""",
                 unsafe_allow_html=True,
             )
@@ -685,10 +739,13 @@ for idx, h in enumerate(horizons):
             high = data["upper_bound_95ci"]
             tier = get_epa_tier_details(pred)
             st.markdown(f"""
-            <div class="card" style="border-left: 3px solid {tier['color']}; background:{tier['bg']};">
+            <div class="card" style="border-left:3px solid {tier['color']};
+                                     background:{tier['bg']};">
                 <div style="font-size:0.68rem; color:#475569; text-transform:uppercase;
-                            letter-spacing:0.1em; margin-bottom:10px; font-family:'JetBrains Mono',monospace;">
-                    95% CI &nbsp;·&nbsp; <span style="color:#10b981;">● live</span>
+                            letter-spacing:0.1em; margin-bottom:10px;
+                            font-family:'JetBrains Mono',monospace;">
+                    95% CI &nbsp;·&nbsp;
+                    <span style="color:#10b981;">● live</span>
                 </div>
                 <div style="font-size:1.5rem; font-weight:700; color:{tier['color']};
                             font-family:'JetBrains Mono',monospace; letter-spacing:-0.02em;">
@@ -702,83 +759,75 @@ for idx, h in enumerate(horizons):
         else:
             st.markdown(
                 f"""<div class="card" style="border-left:3px solid #334155;">
-                    <div style="font-size:0.68rem; color:#475569; font-family:'JetBrains Mono',monospace;">
-                        95% CI &nbsp;·&nbsp; <span style="color:#f59e0b;">◌ unavailable</span>
+                    <div style="font-size:0.68rem; color:#475569;
+                                font-family:'JetBrains Mono',monospace;">
+                        95% CI &nbsp;·&nbsp;
+                        <span style="color:#f59e0b;">◌ unavailable</span>
                     </div>
                     <div style="font-size:0.78rem; color:#334155; margin-top:10px;">
-                        {"Backend offline or model not trained yet." if not _flask_reachable else "Model artifact loading — refresh in ~30 s."}
+                        {"Backend offline or model not trained yet."
+                         if not _flask_reachable
+                         else "Model artifact loading — refresh in ~30 s."}
                     </div>
                 </div>""",
                 unsafe_allow_html=True,
             )
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
 #  SECTION 2 — CROSS-MODEL LIVE BENCHMARKING
-# ═══════════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
 st.markdown("<hr>", unsafe_allow_html=True)
 st.markdown("### ⚖️ Cross-Model Live Benchmarking")
 st.caption("All three models evaluated simultaneously on the current input vector.")
 
 bench_cols   = st.columns(3, gap="large")
-all_models   = ["random_forest", "xgboost", "ridge"]
-model_labels = {"random_forest": "🌲 Random Forest", "xgboost": "🚀 XGBoost", "ridge": "📊 Ridge"}
+model_labels = {k: v for k, v in zip(
+    ["random_forest", "xgboost", "ridge"],
+    ["🌲 Random Forest", "🚀 XGBoost", "📊 Ridge"],
+)}
 
-for idx, m_key in enumerate(all_models):
+for idx, m_key in enumerate(["random_forest", "xgboost", "ridge"]):
     with bench_cols[idx]:
         st.markdown(f"**{model_labels[m_key]}**")
         rows = []
         for h in horizons:
-            data = _fetch_prediction(m_key, h) if _flask_reachable else None
-            if data:
-                rows.append((h, data["aqi_prediction"], get_epa_tier_details(data["aqi_prediction"])))
+            d = _fetch_prediction(m_key, h) if _flask_reachable else None
+            if d:
+                rows.append((h, d["aqi_prediction"], get_epa_tier_details(d["aqi_prediction"])))
 
         if rows:
-            cards_html = ""
+            html = ""
             for h, pred, tier in rows:
-                cards_html += f"""
+                html += f"""
                 <div style="display:flex; justify-content:space-between; align-items:center;
                             padding:10px 14px; margin-bottom:8px; border-radius:10px;
-                            background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.06);">
-                    <span style="font-size:0.78rem; color:#64748b; font-family:'JetBrains Mono',monospace;">{h}h</span>
+                            background:rgba(255,255,255,0.03);
+                            border:1px solid rgba(255,255,255,0.06);">
+                    <span style="font-size:0.78rem; color:#64748b;
+                                 font-family:'JetBrains Mono',monospace;">{h}h</span>
                     <span style="font-size:0.78rem; font-weight:700; color:{tier['color']};
                                  font-family:'JetBrains Mono',monospace;">{int(pred)}</span>
-                    <span style="font-size:0.65rem; color:{tier['color']}; opacity:0.7;">{tier['label']}</span>
+                    <span style="font-size:0.65rem; color:{tier['color']};
+                                 opacity:0.7;">{tier['label']}</span>
                 </div>"""
-            st.markdown(f'<div style="margin-top:8px;">{cards_html}</div>', unsafe_allow_html=True)
+            st.markdown(f'<div style="margin-top:8px;">{html}</div>', unsafe_allow_html=True)
         else:
             st.markdown(
-                """<div style="padding:16px; border-radius:10px; background:rgba(255,255,255,0.02);
-                              border:1px solid rgba(255,255,255,0.05); font-size:0.78rem;
-                              color:#334155; font-family:'JetBrains Mono',monospace;">
+                """<div style="padding:16px; border-radius:10px;
+                              background:rgba(255,255,255,0.02);
+                              border:1px solid rgba(255,255,255,0.05);
+                              font-size:0.78rem; color:#334155;
+                              font-family:'JetBrains Mono',monospace;">
                     — unavailable —
                 </div>""",
                 unsafe_allow_html=True,
             )
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  METRICS FETCH  (shared by sections 3, 5, 6)
-# ═══════════════════════════════════════════════════════════════════════════════
-_MODEL_COLORS = {
-    "Random Forest": "#3b82f6",
-    "XGBoost":       "#10b981",
-    "Ridge":         "#f59e0b",
-}
-_TRANSPARENT  = "rgba(0,0,0,0)"
-_GRID_COLOR   = "rgba(255,255,255,0.06)"
-_TEXT_COLOR   = "#94a3b8"
-_FONT         = "JetBrains Mono, monospace"
-
-_LAYOUT = dict(
-    plot_bgcolor  = _TRANSPARENT,
-    paper_bgcolor = _TRANSPARENT,
-    font          = dict(color=_TEXT_COLOR, family=_FONT, size=11),
-    margin        = dict(l=10, r=10, t=48, b=10),
-    legend        = dict(bgcolor="rgba(255,255,255,0.03)", bordercolor="rgba(255,255,255,0.08)",
-                         borderwidth=1, font=dict(color="#cbd5e1", size=10)),
-)
-
+# ═════════════════════════════════════════════════════════════════════════════
+#  METRICS FETCH — shared by Sections 3, 5, 6
+# ═════════════════════════════════════════════════════════════════════════════
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def _fetch_all_metrics(gateway: str) -> tuple[dict, str | None]:
@@ -797,16 +846,10 @@ def _fetch_all_metrics(gateway: str) -> tuple[dict, str | None]:
 
 _raw_metrics, _metrics_err = _fetch_all_metrics(api_gateway)
 
-_model_name_map = {
-    "random_forest": "Random Forest",
-    "xgboost":       "XGBoost",
-    "ridge":         "Ridge",
-}
-
 
 def _build_metrics_df(payload: dict) -> pd.DataFrame:
     rows = []
-    for api_key, display_name in _model_name_map.items():
+    for api_key, display_name in _MODEL_NAME_MAP.items():
         model_data = payload.get(api_key, {})
         for h in [24, 48, 72]:
             h_data = model_data.get(str(h), {})
@@ -828,9 +871,9 @@ def _build_metrics_df(payload: dict) -> pd.DataFrame:
 metrics_df = _build_metrics_df(_raw_metrics)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  SECTION 3 — MODEL EVALUATION CHARTS (RMSE + R²)
-# ═══════════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
+#  SECTION 3 — MODEL EVALUATION CHARTS
+# ═════════════════════════════════════════════════════════════════════════════
 st.markdown("<hr>", unsafe_allow_html=True)
 st.markdown("### 📊 Model Evaluation Metrics")
 st.caption("Performance telemetry (R², RMSE, MAE, MAPE, Coverage) sourced from MongoDB via Flask.")
@@ -838,8 +881,8 @@ st.caption("Performance telemetry (R², RMSE, MAE, MAPE, Coverage) sourced from 
 if _metrics_err and metrics_df.empty:
     st.error(
         f"**Model metrics unavailable.**\n\n{_metrics_err}\n\n"
-        "Run the training + evaluation pipeline, or check that "
-        "`MONGODB_URI` is set and the `model_metrics` collection has data. "
+        "Run the training + evaluation pipeline, or check that `MONGODB_URI` is set "
+        "and the `model_metrics` collection has data.  "
         "Use `GET /debug/metrics_raw` on the Flask API to inspect what is stored."
     )
 elif _metrics_err:
@@ -886,7 +929,8 @@ if not metrics_df.empty:
         fig_mae.update_yaxes(showgrid=True, gridcolor=_GRID_COLOR, zeroline=False,
                               linecolor="rgba(255,255,255,0.08)",
                               tickfont=dict(color=_TEXT_COLOR, size=10),
-                              title=dict(text="MAE (AQI units)", font=dict(color=_TEXT_COLOR, size=11)))
+                              title=dict(text="MAE (AQI units)",
+                                         font=dict(color=_TEXT_COLOR, size=11)))
         st.plotly_chart(fig_mae, use_container_width=True, config={"displayModeBar": False})
 
     with mape_col:
@@ -913,44 +957,55 @@ if not metrics_df.empty:
         fig_mape.update_yaxes(showgrid=True, gridcolor=_GRID_COLOR, zeroline=False,
                                linecolor="rgba(255,255,255,0.08)",
                                tickfont=dict(color=_TEXT_COLOR, size=10),
-                               title=dict(text="MAPE (%)", font=dict(color=_TEXT_COLOR, size=11)))
+                               title=dict(text="MAPE (%)",
+                                          font=dict(color=_TEXT_COLOR, size=11)))
         st.plotly_chart(fig_mape, use_container_width=True, config={"displayModeBar": False})
 
     st.markdown("#### 📋 Full Metrics Table")
     display_df = metrics_df.copy()
-    display_df["R² Score"]  = display_df["R² Score"].map(lambda x: f"{x:.3f}")
-    display_df["RMSE"]      = display_df["RMSE"].map(lambda x: f"{x:.1f}")
-    display_df["MAE"]       = display_df["MAE"].map(lambda x: f"{x:.1f}")
-    display_df["MAPE"]      = display_df["MAPE"].map(lambda x: f"{x:.2f}%")
-    display_df["Coverage"]  = display_df["Coverage"].map(lambda x: f"{x*100:.1f}%")
-    display_df["Margin"]    = display_df["Margin"].map(lambda x: f"±{x:.1f}")
-    display_df = display_df[["Model", "Horizon", "MAE", "MAPE", "RMSE", "R² Score", "Coverage", "Margin"]]
-    st.dataframe(display_df, use_container_width=True, hide_index=True)
+    display_df["R² Score"] = display_df["R² Score"].map(lambda x: f"{x:.3f}")
+    display_df["RMSE"]     = display_df["RMSE"].map(lambda x: f"{x:.1f}")
+    display_df["MAE"]      = display_df["MAE"].map(lambda x: f"{x:.1f}")
+    display_df["MAPE"]     = display_df["MAPE"].map(lambda x: f"{x:.2f}%")
+    display_df["Coverage"] = display_df["Coverage"].map(lambda x: f"{x*100:.1f}%")
+    display_df["Margin"]   = display_df["Margin"].map(lambda x: f"±{x:.1f}")
+    st.dataframe(
+        display_df[["Model", "Horizon", "MAE", "MAPE", "RMSE", "R² Score", "Coverage", "Margin"]],
+        use_container_width=True,
+        hide_index=True,
+    )
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  SECTION 4 — SHAP FEATURE IMPORTANCE
-# ═══════════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
+#  SECTION 4 — SHAP / FEATURE IMPORTANCE
+# ═════════════════════════════════════════════════════════════════════════════
 st.markdown("<hr>", unsafe_allow_html=True)
 st.markdown("### 🧠 SHAP Feature Importance")
-st.caption("Top-10 features by mean |SHAP| value (RF/XGBoost) or |coefficient| (Ridge) — test set.")
+st.caption(
+    "Top-10 features by mean |SHAP| value (RF / XGBoost) "
+    "or |coefficient| (Ridge) — test set."
+)
 
 
-# FIX-SHAP-RIDGE: two-stage fetch
-#   Stage 1 — try /shap/<model>/<horizon>  (model_shap collection, RF + XGBoost)
-#   Stage 2 — if empty, try /features/<model>/<horizon>  (model_features, Ridge coef)
-#   Both return identical record format: {"feature": str, "mean_abs_shap": float}
-#   so the chart below needs zero changes.
 @st.cache_data(ttl=1800, show_spinner=False)
-def _fetch_shap_or_coef(gateway: str, model_key: str, horizon: int) -> tuple[list[dict], str]:
+def _fetch_shap_or_coef(
+    gateway: str,
+    model_key: str,
+    horizon: int,
+) -> tuple[list[dict], str]:
     """
-    Returns (records, value_label) where value_label is used in the chart title.
-    Falls back from SHAP → coefficient magnitudes for Ridge.
+    FIX-SHAP-RIDGE: two-stage fetch.
+
+    Stage 1 — /shap/<model>/<horizon>  (model_shap, populated for RF + XGBoost)
+    Stage 2 — /features/<model>/<horizon>  (model_features, Ridge |coefficient|)
+
+    Both endpoints return records in the same format:
+      {"feature": str, "mean_abs_shap": float}
+    so the chart code below needs no changes.
     """
     if not _flask_reachable:
         return [], "Mean |SHAP|"
 
-    # Stage 1: SHAP (works for RF and XGBoost)
     r = _api_get(gateway, f"/shap/{model_key}/{horizon}", timeout=(10, 30))
     if r and r.status_code == 200:
         try:
@@ -960,8 +1015,6 @@ def _fetch_shap_or_coef(gateway: str, model_key: str, horizon: int) -> tuple[lis
         except Exception:
             pass
 
-    # Stage 2: feature coefficients (Ridge fallback)
-    # Calls the new /features/<model>/<horizon> route added to api/app.py
     r2 = _api_get(gateway, f"/features/{model_key}/{horizon}", timeout=(10, 30))
     if r2 and r2.status_code == 200:
         try:
@@ -979,13 +1032,13 @@ shap_horizon = st.selectbox(
     key="shap_horizon_sel",
     format_func=lambda h: f"{h}h",
 )
-
-shap_data, shap_value_label = _fetch_shap_or_coef(api_gateway, active_model_key, shap_horizon)
+shap_data, shap_value_label = _fetch_shap_or_coef(
+    api_gateway, active_model_key, shap_horizon
+)
 
 if shap_data:
     features = [d["feature"]       for d in shap_data]
     values   = [d["mean_abs_shap"] for d in shap_data]
-
     fig_shap = go.Figure(go.Bar(
         x=values[::-1], y=features[::-1],
         orientation="h",
@@ -994,7 +1047,9 @@ if shap_data:
             colorscale=[[0, "#1e3a5f"], [0.5, "#3b82f6"], [1, "#60a5fa"]],
             line=dict(width=0),
         ),
-        hovertemplate="<b>%{y}</b><br>" + shap_value_label + ": %{x:.4f}<extra></extra>",
+        hovertemplate=(
+            "<b>%{y}</b><br>" + shap_value_label + ": %{x:.4f}<extra></extra>"
+        ),
     ))
     fig_shap.update_layout(
         **_LAYOUT, height=380,
@@ -1003,23 +1058,25 @@ if shap_data:
             x=0.01, font=dict(color="#f1f5f9", size=14, family=_FONT),
         ),
     )
-    fig_shap.update_xaxes(showgrid=True, gridcolor=_GRID_COLOR, zeroline=False,
-                           tickfont=dict(color=_TEXT_COLOR, size=10),
-                           title=dict(text=shap_value_label, font=dict(color=_TEXT_COLOR, size=11)))
+    fig_shap.update_xaxes(
+        showgrid=True, gridcolor=_GRID_COLOR, zeroline=False,
+        tickfont=dict(color=_TEXT_COLOR, size=10),
+        title=dict(text=shap_value_label, font=dict(color=_TEXT_COLOR, size=11)),
+    )
     fig_shap.update_yaxes(showgrid=False, zeroline=False,
                            tickfont=dict(color="#cbd5e1", size=10))
     st.plotly_chart(fig_shap, use_container_width=True, config={"displayModeBar": False})
 else:
     st.info(
-        "Feature importance data not yet available for this model/horizon. "
-        "Once the training pipeline runs and writes to `model_shap` (RF/XGBoost) "
+        "Feature importance data not yet available for this model / horizon.  "
+        "Once the training pipeline writes to `model_shap` (RF / XGBoost) "
         "or `model_features` (Ridge) in MongoDB, this chart will populate automatically."
     )
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
 #  SECTION 5 — SKILL SCORE & CONFORMAL COVERAGE
-# ═══════════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
 st.markdown("<hr>", unsafe_allow_html=True)
 st.markdown("### 🎯 Forecast Skill & Conformal Coverage")
 st.caption(
@@ -1029,10 +1086,17 @@ st.caption(
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def _fetch_skill_data(gateway: str) -> list[dict]:
+def _fetch_skill_data(gateway: str, raw_metrics: dict) -> list[dict]:
+    """
+    FIX-SKILL-CACHE: previously ignored `gateway` and read _raw_metrics from
+    the outer scope — if the cache was cold and _raw_metrics was empty at that
+    moment, the function always returned an empty list on subsequent calls.
+    Now takes raw_metrics as an explicit argument so the cached result is
+    always computed from the data that was actually passed in.
+    """
     rows = []
-    for api_key, display_name in _model_name_map.items():
-        model_data = _raw_metrics.get(api_key, {})
+    for api_key, display_name in _MODEL_NAME_MAP.items():
+        model_data = raw_metrics.get(api_key, {})
         for h in [24, 48, 72]:
             h_data = model_data.get(str(h), {})
             if "error" in h_data:
@@ -1048,11 +1112,10 @@ def _fetch_skill_data(gateway: str) -> list[dict]:
     return rows
 
 
-skill_rows = _fetch_skill_data(api_gateway)
+skill_rows = _fetch_skill_data(api_gateway, _raw_metrics)
 
 if skill_rows:
     skill_df = pd.DataFrame(skill_rows)
-
     cov_col, margin_col = st.columns(2, gap="large")
 
     with cov_col:
@@ -1104,22 +1167,37 @@ if skill_rows:
                                  tickfont=dict(color=_TEXT_COLOR, size=10))
         fig_margin.update_yaxes(showgrid=True, gridcolor=_GRID_COLOR, zeroline=False,
                                  tickfont=dict(color=_TEXT_COLOR, size=10),
-                                 title=dict(text="AQI units", font=dict(color=_TEXT_COLOR, size=11)))
+                                 title=dict(text="AQI units",
+                                            font=dict(color=_TEXT_COLOR, size=11)))
         st.plotly_chart(fig_margin, use_container_width=True, config={"displayModeBar": False})
-else:
-    if _flask_reachable:
-        st.info("Skill and coverage data will appear here after the training pipeline runs.")
+elif _flask_reachable:
+    st.info("Skill and coverage data will appear here after the training pipeline runs.")
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
 #  SECTION 6 — STRATIFIED BAND ERRORS
-# ═══════════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
 st.markdown("<hr>", unsafe_allow_html=True)
 st.markdown("### 🏷️ Error by AQI Tier")
 st.caption(
     "MAE broken down by EPA health tier — reveals how accurate each model is "
     "specifically for hazardous (>200) and very unhealthy (>150) conditions."
 )
+
+_BAND_LABELS = {
+    "good_moderate":       "Good–Moderate (0–100)",
+    "unhealthy_sensitive": "USG (101–150)",
+    "unhealthy":           "Unhealthy (151–200)",
+    "very_unhealthy":      "Very Unhealthy (201–300)",
+    "hazardous":           "Hazardous (301+)",
+}
+_BAND_COLORS = {
+    "Good–Moderate (0–100)":    "#00e676",
+    "USG (101–150)":            "#ff9100",
+    "Unhealthy (151–200)":      "#ff1744",
+    "Very Unhealthy (201–300)": "#d500f9",
+    "Hazardous (301+)":         "#b71c1c",
+}
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
@@ -1129,22 +1207,6 @@ def _fetch_band_errors(gateway: str) -> pd.DataFrame:
     r = _api_get(gateway, "/debug/metrics_raw", timeout=(10, 30))
     if not r or r.status_code != 200:
         return pd.DataFrame()
-
-    BAND_LABELS = {
-        "good_moderate":       "Good–Moderate (0–100)",
-        "unhealthy_sensitive": "USG (101–150)",
-        "unhealthy":           "Unhealthy (151–200)",
-        "very_unhealthy":      "Very Unhealthy (201–300)",
-        "hazardous":           "Hazardous (301+)",
-    }
-    BAND_COLORS = {
-        "Good–Moderate (0–100)":    "#00e676",
-        "USG (101–150)":            "#ff9100",
-        "Unhealthy (151–200)":      "#ff1744",
-        "Very Unhealthy (201–300)": "#d500f9",
-        "Hazardous (301+)":         "#b71c1c",
-    }
-
     try:
         docs = r.json().get("docs", [])
         rows = []
@@ -1154,7 +1216,7 @@ def _fetch_band_errors(gateway: str) -> pd.DataFrame:
                 continue
             model   = doc.get("model", "?")
             horizon = doc.get("horizon_h", 0)
-            for band_key, label in BAND_LABELS.items():
+            for band_key, label in _BAND_LABELS.items():
                 bdata = bands.get(band_key, {})
                 mae   = bdata.get("mae")
                 n     = bdata.get("n", 0)
@@ -1165,7 +1227,7 @@ def _fetch_band_errors(gateway: str) -> pd.DataFrame:
                         "Band":    label,
                         "MAE":     float(mae),
                         "N":       int(n),
-                        "Color":   BAND_COLORS.get(label, "#64748b"),
+                        "Color":   _BAND_COLORS.get(label, "#64748b"),
                     })
         return pd.DataFrame(rows)
     except Exception:
@@ -1175,9 +1237,8 @@ def _fetch_band_errors(gateway: str) -> pd.DataFrame:
 band_df = _fetch_band_errors(api_gateway)
 
 if not band_df.empty:
-    band_horizons = [f"{h}h" for h in [24, 48, 72]]
     b_cols = st.columns(3, gap="medium")
-    for ci, bh in enumerate(band_horizons):
+    for ci, bh in enumerate([f"{h}h" for h in [24, 48, 72]]):
         with b_cols[ci]:
             df_bh = band_df[band_df["Horizon"] == bh]
             if df_bh.empty:
@@ -1185,51 +1246,60 @@ if not band_df.empty:
                 continue
 
             fig_b = go.Figure()
-            for model in ["RandomForest", "XGBoost", "Ridge"]:
-                color = _MODEL_COLORS.get(
-                    {"RandomForest": "Random Forest", "XGBoost": "XGBoost", "Ridge": "Ridge"}.get(model, model),
-                    "#64748b",
-                )
-                df_bm = df_bh[df_bh["Model"] == model]
+            # FIX-BAND-NAMES: use _MONGO_TO_DISPLAY so model name strings
+            # are defined in one place (_MODEL_NAME_MAP / _MONGO_TO_DISPLAY)
+            # and not scattered as string literals throughout the file.
+            for mongo_name, display_name in _MONGO_TO_DISPLAY.items():
+                color = _MODEL_COLORS.get(display_name, "#64748b")
+                df_bm = df_bh[df_bh["Model"] == mongo_name]
                 if df_bm.empty:
                     continue
                 fig_b.add_trace(go.Bar(
-                    name=model,
+                    name=display_name,
                     x=df_bm["Band"],
                     y=df_bm["MAE"],
                     marker_color=color,
                     opacity=0.85,
-                    hovertemplate="<b>%{x}</b><br>MAE: %{y:.1f}  n=%{customdata}<extra>" + model + "</extra>",
                     customdata=df_bm["N"],
+                    hovertemplate=(
+                        "<b>%{x}</b><br>MAE: %{y:.1f}  n=%{customdata}"
+                        "<extra>" + display_name + "</extra>"
+                    ),
                 ))
             fig_b.update_layout(
                 **_LAYOUT, barmode="group", bargap=0.2, height=340,
                 title=dict(text=f"Band MAE — {bh}", x=0.01,
                            font=dict(color="#f1f5f9", size=13, family=_FONT)),
-                xaxis=dict(tickangle=-35, tickfont=dict(color=_TEXT_COLOR, size=8),
-                           showgrid=False, zeroline=False, linecolor="rgba(255,255,255,0.08)"),
-                yaxis=dict(showgrid=True, gridcolor=_GRID_COLOR, zeroline=False,
-                           tickfont=dict(color=_TEXT_COLOR, size=9),
-                           title=dict(text="MAE", font=dict(color=_TEXT_COLOR, size=10))),
+                xaxis=dict(
+                    tickangle=-35,
+                    tickfont=dict(color=_TEXT_COLOR, size=8),
+                    showgrid=False, zeroline=False,
+                    linecolor="rgba(255,255,255,0.08)",
+                ),
+                yaxis=dict(
+                    showgrid=True, gridcolor=_GRID_COLOR, zeroline=False,
+                    tickfont=dict(color=_TEXT_COLOR, size=9),
+                    title=dict(text="MAE", font=dict(color=_TEXT_COLOR, size=10)),
+                ),
             )
             st.plotly_chart(fig_b, use_container_width=True, config={"displayModeBar": False})
-else:
-    if _flask_reachable:
-        st.info(
-            "Band-level MAE will appear here automatically — the training pipeline already "
-            "stores `error_by_band` inside each `model_metrics` document.  "
-            "The `/debug/metrics_raw` endpoint needs to be reachable and the "
-            "training pipeline needs to have run at least once."
-        )
+elif _flask_reachable:
+    st.info(
+        "Band-level MAE will appear here automatically — the training pipeline "
+        "stores `error_by_band` inside each `model_metrics` document.  "
+        "The `/debug/metrics_raw` endpoint needs to be reachable and the "
+        "training pipeline needs to have run at least once."
+    )
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
 #  FOOTER
-# ═══════════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
 st.markdown("<hr>", unsafe_allow_html=True)
 st.markdown(f"""
 <div style="display:flex; justify-content:space-between; align-items:center;
-            font-size:0.68rem; color:#334155; font-family:'JetBrains Mono',monospace; padding-bottom:1rem;">
+            font-size:0.68rem; color:#334155;
+            font-family:'JetBrains Mono',monospace; padding-bottom:1rem;">
     <span>AirWind Karachi — MLOps AQI Intelligence Platform</span>
     <span>Backend: <code style="color:#475569;">{api_gateway}</code></span>
 </div>
