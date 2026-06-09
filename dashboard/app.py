@@ -203,23 +203,34 @@ section[data-testid="stSidebarCollapsedControl"] { visibility: visible !importan
 #  ROBUST API LAYER  —  handles Render cold-starts and 502s gracefully
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_MAX_RETRIES  = 3
-_BACKOFF_BASE = 2   # seconds; doubles each retry
+_MAX_RETRIES  = 6      # enough for a full Render free-tier cold-start (~45 s)
+_BACKOFF_BASE = 2      # seconds
 
 
 def _warm_up_render(gateway: str) -> bool:
+    """
+    Polls /health until the Render service responds 200.
+
+    FIX: ConnectionError is now retried instead of returning False immediately.
+    On Render free tier the service takes ~30-45 s to wake from sleep; during
+    that window every connection attempt raises ConnectionError (port not yet
+    bound).  The old code treated the first ConnectionError as permanent failure
+    and cached False for 60 s, making the entire dashboard appear broken even
+    though the API came up seconds later.
+    """
     for attempt in range(_MAX_RETRIES):
         try:
             r = requests.get(f"{gateway}/health", timeout=(10, 30))
             if r.status_code == 200:
                 return True
-        except requests.exceptions.Timeout:
+            # Non-200 but server responded (e.g. 502 during boot) — keep retrying
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+            # Service not ready yet — sleep and retry
             pass
-        except requests.exceptions.ConnectionError:
-            return False
         except Exception:
             pass
-        time.sleep(_BACKOFF_BASE ** attempt)
+        if attempt < _MAX_RETRIES - 1:
+            time.sleep(_BACKOFF_BASE * (attempt + 1))   # 2, 4, 6, 8, 10 s gaps
     return False
 
 
@@ -239,7 +250,14 @@ def _api_get(gateway: str, path: str, timeout: tuple = (15, 45)) -> requests.Res
     return None
 
 
-def _api_post(gateway: str, path: str, payload: dict, timeout: tuple = (15, 60)) -> requests.Response | None:
+def _api_post(gateway: str, path: str, payload: dict, timeout: tuple = (15, 120)) -> requests.Response | None:
+    """
+    FIX: read timeout raised 60 → 120 s.
+    Random Forest artifacts load lazily on first /predict call (GridFS download
+    can take 30-90 s on Render free tier).  The old 60 s read timeout caused
+    the first RF prediction request to time out mid-transfer and return None,
+    showing blank gauges even though the API was working correctly.
+    """
     for attempt in range(_MAX_RETRIES):
         try:
             r = requests.post(f"{gateway}{path}", json=payload, timeout=timeout)
@@ -588,7 +606,7 @@ inference_payload = {
 # ═══════════════════════════════════════════════════════════════════════════════
 #  WARM-UP  —  show a progress spinner while Render wakes up
 # ═══════════════════════════════════════════════════════════════════════════════
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=30, show_spinner=False)  # FIX: 30 s so a false-negative expires quickly
 def _check_api_live(gateway: str) -> bool:
     return _warm_up_render(gateway)
 
