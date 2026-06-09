@@ -20,11 +20,16 @@ FIX 12 — _build_feature_vector always applies lag1_overrides via base.update()
           instead of only updating keys already present in base. Prevents 0-valued
           features when the feature doc is stale or missing a lag column.
 FIX 13 — /debug/feature_mismatch/<model>/<horizon> route added for diagnostics.
+FIX 14 — Background warmup thread pre-loads all 9 model artifacts from GridFS at
+          startup so the first /predict call hits the in-memory cache instead of
+          blocking the sync worker on a cold GridFS download (which caused the
+          30s/120s worker timeout death-loop on Render free tier).
 """
 
 import os
 import sys
 import time
+import threading
 import traceback
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -123,7 +128,7 @@ def _get_latest_feature_doc() -> dict | None:
         client = _mongo_client()
         db     = client[DB_NAME]
         col    = db[FEAT_COL]
-        doc    = col.find_one({}, sort=[("datetime", -1)])   # FIX: use datetime index (not timestamp)
+        doc    = col.find_one({}, sort=[("datetime", -1)])
         if doc is None:
             doc = col.find_one({}, sort=[("timestamp", -1)])
         client.close()
@@ -259,6 +264,43 @@ def load_prediction_artifacts(model_type: str, horizon: int) -> dict:
     n_features = len(artifact.get("feature_names", []))
     print(f"[model-cache] Loaded '{store_name}' {horizon}h from MongoDB ✓  ({n_features} features)")
     return artifact
+
+
+# ── FIX 14: Background model warmup ──────────────────────────────────────────
+def _warmup_models() -> None:
+    """
+    Pre-load all 9 model artifacts from GridFS into MODEL_CACHE at startup.
+    Runs in a background daemon thread so the worker becomes available
+    immediately and can serve /health, /metrics, /latest_realtime while
+    models are loading in the background.
+
+    This prevents the first /predict call from blocking the sync worker for
+    the full GridFS download duration — which caused the 30s/120s worker
+    timeout death-loop on Render free tier where cold GridFS reads of large
+    RF/XGBoost pickle files exceeded gunicorn's worker timeout.
+
+    By the time Streamlit makes its first /predict call the models are already
+    in MODEL_CACHE and the response is instant.
+    """
+    def _load_all():
+        print("[warmup] Starting background model pre-load ...", flush=True)
+        # Load Ridge first (smallest, fastest) so at least one model is ready
+        # quickly, then RF and XGBoost (larger artifacts).
+        load_order = [
+            ("ridge",         24), ("ridge",         48), ("ridge",         72),
+            ("xgboost",       24), ("xgboost",       48), ("xgboost",       72),
+            ("random_forest", 24), ("random_forest", 48), ("random_forest", 72),
+        ]
+        for model_type, horizon in load_order:
+            try:
+                load_prediction_artifacts(model_type, horizon)
+                print(f"[warmup] ✓ {model_type}/{horizon}h cached", flush=True)
+            except Exception as e:
+                print(f"[warmup] ✗ {model_type}/{horizon}h failed: {e}", flush=True)
+        print("[warmup] Background pre-load complete.", flush=True)
+
+    t = threading.Thread(target=_load_all, daemon=True, name="model-warmup")
+    t.start()
 
 
 # ── Metrics helpers ───────────────────────────────────────────────────────────
@@ -633,6 +675,9 @@ def debug_feature_mismatch(model_type: str, horizon: int):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+
+# ── FIX 14: Kick off background warmup when gunicorn imports this module ─────
+_warmup_models()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))

@@ -38,6 +38,7 @@ from __future__ import annotations
 import io
 import os
 import pickle
+import zlib
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
@@ -335,7 +336,9 @@ def save_model_artifact(
     buf = io.BytesIO()
     pickle.dump(artifact, buf)
     buf.seek(0)
-    model_bytes = buf.read()
+    raw_bytes   = buf.read()
+    model_bytes = zlib.compress(raw_bytes, level=6)  # FIX: compress before GridFS upload (3-5x smaller)
+    compressed  = True
 
     rid      = run_id or _run_id()
     filename = f"artifact_{model_name}_{horizon}h.pkl"
@@ -359,7 +362,8 @@ def save_model_artifact(
             "updated_at":       datetime.now(tz=timezone.utc),
             "gridfs_filename":  filename,
             "gridfs_id":        file_id,
-            "size_bytes":       len(model_bytes),
+            "size_bytes":       len(raw_bytes),
+            "compressed":       compressed,
             # Metadata duplicated here for fast reads without touching GridFS
             "feature_names":    artifact.get("feature_names", []),
             "conformal_margin": artifact.get("conformal_margin"),
@@ -368,7 +372,7 @@ def save_model_artifact(
     )
     print(
         f"  [mongo_store] ✅ Model artifact saved → GridFS ({model_name} {horizon}h, "
-        f"{len(model_bytes) / 1_048_576:.1f} MB)"
+        f"{len(raw_bytes) / 1_048_576:.1f} MB raw → {len(model_bytes) / 1_048_576:.1f} MB compressed)"
     )
 
 
@@ -376,12 +380,12 @@ def load_model_artifact(model_name: str, horizon: int) -> dict | None:
     """
     Retrieve and deserialise a model artifact from GridFS.
     Returns the full artifact dict (including the fitted estimator) or None.
+    Supports both compressed (zlib) and legacy uncompressed artifacts.
     """
     db = get_db()
-    # Look up the GridFS filename from the pointer document
     pointer = db["model_artifacts"].find_one(
         {"model": model_name, "horizon_h": horizon},
-        {"gridfs_filename": 1},
+        {"gridfs_filename": 1, "compressed": 1},
     )
     if not pointer:
         return None
@@ -389,6 +393,14 @@ def load_model_artifact(model_name: str, horizon: int) -> dict | None:
     raw = _gridfs_get(pointer["gridfs_filename"])
     if raw is None:
         return None
+
+    # FIX: decompress if saved with zlib compression; fall back for old artifacts
+    if pointer.get("compressed", False):
+        try:
+            raw = zlib.decompress(raw)
+        except zlib.error:
+            pass  # already uncompressed legacy artifact — load as-is
+
     return pickle.loads(raw)
 
 
