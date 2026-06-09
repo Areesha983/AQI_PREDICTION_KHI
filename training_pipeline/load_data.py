@@ -12,6 +12,7 @@ import sys
 from pathlib import Path
 import numpy as np
 import pandas as pd
+import certifi
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
 from dotenv import load_dotenv
@@ -78,10 +79,18 @@ def _fetch_from_feature_store() -> pd.DataFrame:
 
     print(f"Connecting to feature warehouse: {DB_NAME}.{COLLECTION_NAME}", flush=True)
     try:
-        client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000, socketTimeoutMS=120000)
+        client = MongoClient(
+            MONGO_URI,
+            serverSelectionTimeoutMS=15000,
+            connectTimeoutMS=15000,
+            socketTimeoutMS=120000,
+            tlsCAFile=certifi.where(),
+        )
         db = client[DB_NAME]
-        
-        cursor = db[COLLECTION_NAME].find({}, {"_id": 0})
+
+        # batch_size prevents a single oversized network read that triggers the
+        # socket timeout when the collection is large (>10k docs).
+        cursor = db[COLLECTION_NAME].find({}, {"_id": 0}).batch_size(500)
         documents = list(cursor)
         client.close()
     except PyMongoError as e:

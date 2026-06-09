@@ -310,37 +310,37 @@ def _metrics_from_mongo(model_type: str) -> dict:
         return {str(h): {"error": f"Unknown model type: {model_type!r}"} for h in sorted(VALID_HORIZONS)}
 
     report: dict = {}
-    for h in sorted(VALID_HORIZONS):
-        h_key = f"{h}h"
-        try:
-            client = _mongo_client()
-            db     = client[DB_NAME]
-            m_doc  = db[METRICS_COL].find_one(
-                {"model": store_name, "horizon_h": h},
-                {"_id": 0},
-            )
-            client.close()
-
-            if m_doc:
-                report[str(h)] = {
-                    "r2":       _extract_metric(m_doc, "r2"),
-                    "rmse":     _extract_metric(m_doc, "rmse"),
-                    "mae":      _extract_metric(m_doc, "mae"),
-                    "mape":     _extract_metric(m_doc, "mape"),
-                    "coverage": _extract_metric(m_doc, "coverage"),
-                    "margin":   _extract_metric(m_doc, "margin"),
-                }
-                print(f"[metrics] {store_name}/{h_key} loaded from model_metrics ✓")
-            else:
-                report[str(h)] = {"error": (
-                    f"No metrics found in MongoDB for model='{store_name}', horizon={h_key}. "
-                    "Run the training script first."
-                )}
-                print(f"[metrics] {store_name}/{h_key} — MongoDB miss.")
-
-        except PyMongoError as e:
-            print(f"[metrics] {store_name}/{h_key} query failed: {e}")
-            report[str(h)] = {"error": f"MongoDB query failed: {e}"}
+    try:
+        client = _mongo_client()
+        db     = client[DB_NAME]
+        for h in sorted(VALID_HORIZONS):
+            h_key = f"{h}h"
+            try:
+                m_doc = db[METRICS_COL].find_one(
+                    {"model": store_name, "horizon_h": h},
+                    {"_id": 0},
+                )
+                if m_doc:
+                    report[str(h)] = {
+                        "r2":       _extract_metric(m_doc, "r2"),
+                        "rmse":     _extract_metric(m_doc, "rmse"),
+                        "mae":      _extract_metric(m_doc, "mae"),
+                        "mape":     _extract_metric(m_doc, "mape"),
+                        "coverage": _extract_metric(m_doc, "coverage"),
+                        "margin":   _extract_metric(m_doc, "margin"),
+                    }
+                    print(f"[metrics] {store_name}/{h_key} loaded from model_metrics ✓")
+                else:
+                    report[str(h)] = {"error": (
+                        f"No metrics found in MongoDB for model='{store_name}', horizon={h_key}. "
+                        "Run the training script first."
+                    )}
+                    print(f"[metrics] {store_name}/{h_key} — MongoDB miss.")
+            except PyMongoError as e:
+                print(f"[metrics] {store_name}/{h_key} query failed: {e}")
+                report[str(h)] = {"error": f"MongoDB query failed: {e}"}
+    finally:
+        client.close()
 
     return report
 
