@@ -203,35 +203,13 @@ section[data-testid="stSidebarCollapsedControl"] { visibility: visible !importan
 #  ROBUST API LAYER  —  handles Render cold-starts and 502s gracefully
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_MAX_RETRIES  = 6      # enough for a full Render free-tier cold-start (~45 s)
-_BACKOFF_BASE = 2      # seconds
-
-
 def _warm_up_render(gateway: str) -> bool:
-    """
-    Polls /health until the Render service responds 200.
-
-    FIX: ConnectionError is now retried instead of returning False immediately.
-    On Render free tier the service takes ~30-45 s to wake from sleep; during
-    that window every connection attempt raises ConnectionError (port not yet
-    bound).  The old code treated the first ConnectionError as permanent failure
-    and cached False for 60 s, making the entire dashboard appear broken even
-    though the API came up seconds later.
-    """
-    for attempt in range(_MAX_RETRIES):
-        try:
-            r = requests.get(f"{gateway}/health", timeout=(10, 30))
-            if r.status_code == 200:
-                return True
-            # Non-200 but server responded (e.g. 502 during boot) — keep retrying
-        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
-            # Service not ready yet — sleep and retry
-            pass
-        except Exception:
-            pass
-        if attempt < _MAX_RETRIES - 1:
-            time.sleep(_BACKOFF_BASE * (attempt + 1))   # 2, 4, 6, 8, 10 s gaps
-    return False
+    """Single fast health check — no blocking retries."""
+    try:
+        r = requests.get(f"{gateway}/health", timeout=(5, 10))
+        return r.status_code == 200
+    except Exception:
+        return False
 
 
 def _api_get(gateway: str, path: str, timeout: tuple = (15, 45)) -> requests.Response | None:
@@ -606,7 +584,7 @@ inference_payload = {
 # ═══════════════════════════════════════════════════════════════════════════════
 #  WARM-UP  —  show a progress spinner while Render wakes up
 # ═══════════════════════════════════════════════════════════════════════════════
-@st.cache_data(ttl=30, show_spinner=False)  # FIX: 30 s so a false-negative expires quickly
+@st.cache_data(ttl=300, show_spinner=False)
 def _check_api_live(gateway: str) -> bool:
     return _warm_up_render(gateway)
 
