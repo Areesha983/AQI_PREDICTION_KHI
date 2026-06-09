@@ -203,6 +203,10 @@ section[data-testid="stSidebarCollapsedControl"] { visibility: visible !importan
 #  ROBUST API LAYER  —  handles Render cold-starts and 502s gracefully
 # ═══════════════════════════════════════════════════════════════════════════════
 
+_MAX_RETRIES  = 3
+_BACKOFF_BASE = 2
+
+
 def _warm_up_render(gateway: str) -> bool:
     """Single fast health check — no blocking retries."""
     try:
